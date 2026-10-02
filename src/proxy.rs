@@ -756,6 +756,188 @@ fn patch_completed_output(response: &mut Value, items: BTreeMap<u64, Value>, ext
     }
 }
 
+/// Completed output items of the Codex response in progress, from `response.output_item.done`.
+///
+/// Observed live contract (ChatGPT Codex backend, SSE and WebSocket): every completed item is
+/// delivered as `response.output_item.done`, and the terminal `response.completed` /
+/// `response.incomplete` then carries `response.output: []`. Clients that take the terminal
+/// response as final (the OpenAI SDK stream helpers, `ResponsesConnection` users) would see no
+/// output and lose tool calls, so the gateway fills an empty terminal output from these items.
+///
+/// Bounded: at most [`MAX_OUTPUT_ITEMS`] items and [`MAX_COLLECTED`] serialized bytes are held
+/// (an item replaced at the same `output_index` is accounted once), and a filled terminal event
+/// must encode within [`MAX_EVENT`]. Exceeding a bound is an [`OutputOverflow`]: the caller fails
+/// the response visibly rather than forwarding a terminal that claims success with no output.
+#[derive(Default)]
+struct CodexOutput {
+    items: BTreeMap<u64, (Value, usize)>,
+    unindexed: Vec<(Value, usize)>,
+    /// Serialized bytes of the items held.
+    size: usize,
+}
+
+/// Most completed output items accumulated for one Codex response.
+const MAX_OUTPUT_ITEMS: usize = 4096;
+
+/// A Codex response whose completed output cannot be held or re-emitted within the bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OutputOverflow {
+    /// More than `MAX_COLLECTED` bytes or `MAX_OUTPUT_ITEMS` items accumulated.
+    Accumulated,
+    /// The filled terminal event would exceed `MAX_EVENT` once encoded.
+    Terminal,
+}
+impl OutputOverflow {
+    /// Constant label for the request log.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accumulated => "Codex output exceeds 16 MiB or 4096 items",
+            Self::Terminal => "Codex final response exceeds 16 MiB",
+        }
+    }
+    /// Message for the client; the output delivered so far stands, and retrying would only
+    /// produce the same oversized response.
+    fn message(self) -> &'static str {
+        match self {
+            Self::Accumulated => {
+                "The response output exceeds the gateway limit of 16 MiB or 4096 items. Output so far may be partial; do not retry the same request automatically."
+            }
+            Self::Terminal => {
+                "The final response exceeds the gateway limit of 16 MiB. Output so far may be partial; do not retry the same request automatically."
+            }
+        }
+    }
+}
+
+impl CodexOutput {
+    fn observe(&mut self, e: &Value) -> Result<(), OutputOverflow> {
+        match e["type"].as_str().unwrap_or("") {
+            "response.created" => *self = Self::default(),
+            "response.output_item.done" if e["item"].is_object() => {
+                let item = e["item"].clone();
+                let size = serde_json::to_vec(&item).map_or(0, |b| b.len());
+                self.size += size;
+                match e["output_index"].as_u64() {
+                    Some(i) => {
+                        if let Some((_, replaced)) = self.items.insert(i, (item, size)) {
+                            self.size -= replaced;
+                        }
+                    }
+                    None => self.unindexed.push((item, size)),
+                }
+                let count = self.items.len() + self.unindexed.len();
+                if self.size > MAX_COLLECTED || count > MAX_OUTPUT_ITEMS {
+                    *self = Self::default(); // release the memory; the response is failed
+                    return Err(OutputOverflow::Accumulated);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    /// Fills an empty `output` of a terminal response object; the items are consumed.
+    fn fill(&mut self, response: &mut Value) {
+        let taken = std::mem::take(self);
+        let items = taken.items.into_iter().map(|(i, (v, _))| (i, v)).collect();
+        let unindexed = taken.unindexed.into_iter().map(|(v, _)| v).collect();
+        patch_completed_output(response, items, unindexed);
+    }
+    /// For a terminal event whose `response.output` is empty and for which items were seen,
+    /// returns a copy with the items filled in (all other fields kept). `Ok(None)` means the
+    /// event is forwarded exactly as received. A filled event whose JSON encoding exceeds
+    /// `MAX_EVENT` is an overflow, never a silent fallback to the empty output.
+    fn complete(&mut self, e: &Value) -> Result<Option<Value>, OutputOverflow> {
+        if !matches!(
+            e["type"].as_str(),
+            Some("response.completed" | "response.incomplete")
+        ) {
+            return Ok(None);
+        }
+        let empty = e["response"]["output"]
+            .as_array()
+            .is_some_and(|o| o.is_empty());
+        if !empty || (self.items.is_empty() && self.unindexed.is_empty()) {
+            *self = Self::default();
+            return Ok(None);
+        }
+        let mut patched = e.clone();
+        self.fill(&mut patched["response"]);
+        let encoded = serde_json::to_vec(&patched).map_or(usize::MAX, |b| b.len());
+        if encoded > MAX_EVENT {
+            return Err(OutputOverflow::Terminal);
+        }
+        Ok(Some(patched))
+    }
+}
+
+/// Splits an SSE byte stream into complete raw events, each ending with its blank line, without
+/// changing a byte. Used where whole events must be inspected before they are forwarded.
+struct SseFramer {
+    buf: Vec<u8>,
+    line_start: usize,
+    scanned: usize,
+}
+impl SseFramer {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            line_start: 0,
+            scanned: 0,
+        }
+    }
+    fn push(&mut self, b: &[u8]) -> Result<Vec<Vec<u8>>, ApiError> {
+        self.buf.extend_from_slice(b);
+        let mut blocks = Vec::new();
+        while let Some(offset) = self.buf[self.scanned..].iter().position(|x| *x == b'\n') {
+            let newline = self.scanned + offset;
+            let line = &self.buf[self.line_start..newline];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                blocks.push(self.buf.drain(..=newline).collect());
+                self.line_start = 0;
+                self.scanned = 0;
+            } else {
+                self.line_start = newline + 1;
+                self.scanned = newline + 1;
+            }
+        }
+        self.scanned = self.buf.len();
+        // Room for the `event:`/`id:` lines around a maximal data payload.
+        if self.buf.len() > MAX_EVENT + 64 * 1024 {
+            return Err(ApiError::upstream("Provider event exceeds 16 MiB"));
+        }
+        Ok(blocks)
+    }
+    /// Bytes of an unfinished event, forwarded as-is when the stream ends.
+    fn rest(&mut self) -> Vec<u8> {
+        self.line_start = 0;
+        self.scanned = 0;
+        std::mem::take(&mut self.buf)
+    }
+}
+
+/// Codex accumulation for the events of one complete SSE block (or one WebSocket frame). Returns
+/// the filled terminal event to send instead of the original, if any.
+fn codex_block(
+    output: &mut CodexOutput,
+    events: &[Value],
+) -> Result<Option<Value>, OutputOverflow> {
+    let mut replacement = None;
+    for e in events {
+        output.observe(e)?;
+        if replacement.is_none() {
+            replacement = output.complete(e)?;
+        }
+    }
+    Ok(replacement)
+}
+
+/// One SSE event with the conventional `event:` name line and single-line JSON data.
+fn sse_event_bytes(e: &Value) -> Bytes {
+    let name = e["type"].as_str().unwrap_or("message");
+    Bytes::from(format!("event: {name}\ndata: {e}\n\n"))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Provider errors: native codes preserved, credentials redacted
 // ---------------------------------------------------------------------------------------------
@@ -1008,6 +1190,14 @@ fn stream_error(message: &str) -> Bytes {
         json!({"type":"error","error":{"type":"upstream_interrupted","message":message,"retryable":true,"partial_output":true}})
     ))
 }
+/// Error event for a response the gateway refuses to finish because its output is too large.
+/// Not retryable: the same request would produce the same output.
+fn stream_overflow_error(overflow: OutputOverflow) -> Bytes {
+    Bytes::from(format!(
+        "\n\nevent: error\ndata: {}\n\n",
+        json!({"type":"error","error":{"type":"output_too_large","message":overflow.message(),"retryable":false,"partial_output":true}})
+    ))
+}
 
 /// Incremental WHATWG SSE parser: CRLF/LF lines, multi-line `data:`, comments and other fields
 /// ignored, `[DONE]` surfaced as `{"_done":true}`. A single event is bounded to 16 MiB.
@@ -1209,20 +1399,65 @@ impl ChatTranslator {
     }
 }
 
-/// Relays an upstream SSE body. Bytes are forwarded unchanged unless Chat translation is on.
-/// The request record reflects the protocol outcome, not merely the HTTP status.
-fn relay_stream(
+/// How an upstream SSE body is delivered to the client.
+enum Shape {
+    /// Forwarded byte for byte (native OpenAI, Anthropic and Gemini streams).
+    Passthrough,
+    /// Codex Responses stream: forwarded byte for byte, event by event, except that a terminal
+    /// event with an empty `response.output` is re-emitted with the completed items filled in.
+    Codex(CodexOutput),
+    /// Responses events translated into Chat Completions chunks.
+    Chat(ChatTranslator),
+}
+
+/// Request-record bookkeeping for parsed upstream events: usage, first output, and the
+/// protocol outcome decided by the first terminal event.
+struct StreamOutcome {
     app: App,
-    mut guard: RecordGuard,
-    mut upstream: impl Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
     connection: String,
     status: u16,
-    mut translator: Option<ChatTranslator>,
+    terminal: Option<Terminal>,
+}
+impl StreamOutcome {
+    fn observe(&mut self, guard: &mut RecordGuard, redactor: &Redactor, events: &[Value]) {
+        for e in events {
+            guard.usage(e);
+            guard.observe_output(e);
+            if self.terminal.is_some() {
+                continue;
+            }
+            let Some(terminal) = terminal_event(e) else {
+                continue;
+            };
+            self.terminal = Some(terminal);
+            match terminal {
+                Terminal::Success => {
+                    guard.finish(self.status, None);
+                    if let Some(response_id) = e["response"]["id"].as_str() {
+                        remember_response(&self.app, response_id, &self.connection);
+                    }
+                }
+                Terminal::Failure => {
+                    let label = error_label(e, redactor);
+                    guard.finish(502, Some(&format!("{label} in stream")));
+                }
+            }
+        }
+    }
+}
+
+/// Relays an upstream SSE body according to `shape`. The request record reflects the protocol
+/// outcome, not merely the HTTP status.
+fn relay_stream(
+    mut guard: RecordGuard,
+    mut upstream: impl Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
+    mut outcome: StreamOutcome,
+    mut shape: Shape,
     redactor: Redactor,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
         let mut parser = SseParser::new();
-        let mut outcome: Option<Terminal> = None;
+        let mut framer = SseFramer::new();
         loop {
             let bytes = match upstream.next().await {
                 None => break,
@@ -1231,56 +1466,80 @@ fn relay_stream(
                     bytes
                 }
                 Some(Err(_)) => {
+                    let rest = framer.rest();
+                    if !rest.is_empty() {
+                        yield Ok(Bytes::from(rest));
+                    }
                     // After a terminal event the response is complete; a dropped connection is
                     // not a failure. Before it, output is partial and must not be replayed.
-                    if outcome.is_none() {
+                    if outcome.terminal.is_none() {
                         guard.finish(502, Some("Upstream stream interrupted"));
                         yield Ok(stream_error("Upstream stream interrupted. Output may be partial; do not replay tool actions automatically."));
                     }
                     return;
                 }
             };
-            let events = match parser.push(&bytes) {
-                Ok(events) => events,
-                Err(_) => {
-                    guard.finish(502, Some("Oversized upstream event"));
-                    yield Err(std::io::Error::other("Oversized upstream event"));
-                    return;
+            // Codex streams are handled one complete event at a time; others chunk by chunk.
+            let units: Vec<Bytes> = if matches!(shape, Shape::Codex(_)) {
+                match framer.push(&bytes) {
+                    Ok(blocks) => blocks.into_iter().map(Bytes::from).collect(),
+                    Err(_) => {
+                        guard.finish(502, Some("Oversized upstream event"));
+                        yield Err(std::io::Error::other("Oversized upstream event"));
+                        return;
+                    }
                 }
+            } else {
+                vec![bytes]
             };
-            for e in &events {
-                guard.usage(e);
-                guard.observe_output(e);
-                if outcome.is_some() {
-                    continue;
-                }
-                let Some(terminal) = terminal_event(e) else { continue };
-                outcome = Some(terminal);
-                match terminal {
-                    Terminal::Success => {
-                        guard.finish(status, None);
-                        if let Some(response_id) = e["response"]["id"].as_str() {
-                            remember_response(&app, response_id, &connection);
+            for unit in units {
+                let events = match parser.push(&unit) {
+                    Ok(events) => events,
+                    Err(_) => {
+                        guard.finish(502, Some("Oversized upstream event"));
+                        yield Err(std::io::Error::other("Oversized upstream event"));
+                        return;
+                    }
+                };
+                // Codex accumulation runs before the outcome is recorded: an overflowing response
+                // must end as a 502 without its terminal ever counting as success or setting
+                // response affinity. Output already forwarded stands; nothing is replayed.
+                let replacement = match &mut shape {
+                    Shape::Codex(output) => match codex_block(output, &events) {
+                        Ok(replacement) => replacement,
+                        Err(overflow) => {
+                            guard.finish(502, Some(overflow.label()));
+                            yield Ok(stream_overflow_error(overflow));
+                            return;
+                        }
+                    },
+                    _ => None,
+                };
+                outcome.observe(&mut guard, &redactor, &events);
+                match &mut shape {
+                    Shape::Passthrough => yield Ok(unit),
+                    Shape::Codex(_) => match replacement {
+                        Some(patched) => yield Ok(sse_event_bytes(&patched)),
+                        None => yield Ok(unit),
+                    },
+                    Shape::Chat(translator) => {
+                        for e in &events {
+                            for chunk in translator.translate(e, &redactor) {
+                                yield Ok(chunk);
+                            }
                         }
                     }
-                    Terminal::Failure => {
-                        let label = error_label(e, &redactor);
-                        guard.finish(502, Some(&format!("{label} in stream")));
-                    }
                 }
-            }
-            match translator.as_mut() {
-                Some(t) => {
-                    for e in &events {
-                        for chunk in t.translate(e, &redactor) {
-                            yield Ok(chunk);
-                        }
-                    }
-                }
-                None => yield Ok(bytes),
             }
         }
-        if outcome.is_none() {
+        let rest = framer.rest();
+        if !rest.is_empty() {
+            if let Ok(events) = parser.push(&rest) {
+                outcome.observe(&mut guard, &redactor, &events);
+            }
+            yield Ok(Bytes::from(rest));
+        }
+        if outcome.terminal.is_none() {
             guard.finish(502, Some("Provider stream ended without completion"));
             yield Ok(stream_error("Provider stream ended without completion. Output may be partial."));
         }
@@ -1526,8 +1785,7 @@ async fn collect(
     let mut bytes = Vec::new();
     let mut parser = SseParser::new();
     let mut final_response: Option<Value> = None;
-    let mut items: BTreeMap<u64, Value> = BTreeMap::new();
-    let mut unindexed: Vec<Value> = Vec::new();
+    let mut codex_output = CodexOutput::default();
     while let Some(chunk) = upstream.next().await {
         let b = chunk.map_err(|_| {
             guard.finish(502, Some("Upstream response interrupted"));
@@ -1548,15 +1806,11 @@ async fn collect(
         for v in events {
             guard.usage(&v);
             guard.observe_output(&v);
+            if codex_output.observe(&v).is_err() {
+                guard.finish(502, Some("Response exceeds 16 MiB"));
+                return Err(ApiError::upstream("Response exceeds 16 MiB"));
+            }
             match v["type"].as_str().unwrap_or("") {
-                "response.output_item.done" if v["item"].is_object() => {
-                    match v["output_index"].as_u64() {
-                        Some(i) => {
-                            items.insert(i, v["item"].clone());
-                        }
-                        None => unindexed.push(v["item"].clone()),
-                    }
-                }
                 "response.completed" | "response.incomplete" => {
                     final_response = Some(v["response"].clone());
                 }
@@ -1588,7 +1842,7 @@ async fn collect(
         guard.finish(502, Some("Provider ended without a completed response"));
         ApiError::upstream("Provider ended without a completed response")
     })?;
-    patch_completed_output(&mut response, items, unindexed);
+    codex_output.fill(&mut response);
     Ok(Collected::Value(response))
 }
 
@@ -1711,18 +1965,20 @@ pub async fn execute(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if wants_stream && sse {
-            let translator = plan
-                .chat_translate
-                .then(|| ChatTranslator::new(guard.id(), model.clone()));
-            let stream = relay_stream(
-                app.clone(),
-                guard,
-                res.bytes_stream(),
-                c.id.clone(),
-                status.as_u16(),
-                translator,
-                redactor,
-            );
+            let shape = if plan.chat_translate {
+                Shape::Chat(ChatTranslator::new(guard.id(), model.clone()))
+            } else if c.kind == "codex" {
+                Shape::Codex(CodexOutput::default())
+            } else {
+                Shape::Passthrough
+            };
+            let outcome = StreamOutcome {
+                app: app.clone(),
+                connection: c.id.clone(),
+                status: status.as_u16(),
+                terminal: None,
+            };
+            let stream = relay_stream(guard, res.bytes_stream(), outcome, shape, redactor);
             return Ok(Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1794,6 +2050,13 @@ fn ws_error_frame(kind: &str, message: &str) -> AxMessage {
 fn ws_interrupted_frame(message: &str) -> AxMessage {
     AxMessage::Text(
         json!({"type":"error","error":{"type":"upstream_interrupted","message":message,"retryable":true,"partial_output":true}})
+            .to_string()
+            .into(),
+    )
+}
+fn ws_overflow_frame(overflow: OutputOverflow) -> AxMessage {
+    AxMessage::Text(
+        json!({"type":"error","error":{"type":"output_too_large","message":overflow.message(),"retryable":false,"partial_output":true}})
             .to_string()
             .into(),
     )
@@ -2075,6 +2338,8 @@ async fn relay_ws(
     tokio::pin!(idle);
     // A response is in flight between response.create and its terminal event.
     let mut active = true;
+    // Codex sessions get the same bounded terminal-output fill as Codex SSE (see `CodexOutput`).
+    let mut codex_output = (c.kind == "codex").then(CodexOutput::default);
     loop {
         tokio::select! {
             _ = &mut idle => {
@@ -2138,9 +2403,24 @@ async fn relay_ws(
                 Some(Ok(Message::Text(text))) => {
                     idle.as_mut().reset(tokio::time::Instant::now() + app.timeout);
                     guard.first_byte();
+                    let mut outgoing = None;
                     if let Ok(v) = serde_json::from_str::<Value>(&text) {
                         guard.usage(&v);
                         guard.observe_output(&v);
+                        // Before any completion bookkeeping: an overflowing Codex turn ends the
+                        // session as a 502 with no completed frame and no response affinity.
+                        if let Some(output) = codex_output.as_mut() {
+                            match codex_block(output, std::slice::from_ref(&v)) {
+                                Ok(patched) => outgoing = patched.map(|p| p.to_string()),
+                                Err(overflow) => {
+                                    guard.finish(502, Some(overflow.label()));
+                                    let _ = client_tx.send(ws_overflow_frame(overflow)).await;
+                                    let _ = client_tx.send(AxMessage::Close(None)).await;
+                                    let _ = up_tx.send(Message::Close(None)).await;
+                                    break;
+                                }
+                            }
+                        }
                         if terminal_event(&v).is_some() {
                             guard.close_timing(); // record timings describe the first turn
                         }
@@ -2163,7 +2443,9 @@ async fn relay_ws(
                             _ => {}
                         }
                     }
-                    if client_tx.send(AxMessage::Text(text.to_string().into())).await.is_err() {
+                    // Every other frame is forwarded exactly as received.
+                    let outgoing = outgoing.unwrap_or_else(|| text.to_string());
+                    if client_tx.send(AxMessage::Text(outgoing.into())).await.is_err() {
                         if active {
                             guard.finish(499, Some("Client disconnected before completion"));
                         }

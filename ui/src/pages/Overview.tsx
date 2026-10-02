@@ -1,24 +1,26 @@
-import { ArrowRight, Check, FlaskConical, KeyRound, Plug, Plus, RefreshCw, SquareTerminal, Waypoints, Zap } from 'lucide-react';
+import { ArrowRight, Check, FlaskConical, KeyRound, Plug, RefreshCw, SquareTerminal, Waypoints, Zap } from 'lucide-react';
 import { useMemo, useState, useEffect } from 'react';
 import { useConfig, useConnections, useKeys, useOverview } from '../app/queries';
 import { Link, navigate } from '../app/router';
 import { CopyField } from '../components/Code';
 import { TrafficChart, bucketize } from '../components/TrafficChart';
-import { Badge, Button, Callout, KindMark, PageHead, Skeleton, StatusCode, kindLabel } from '../components/ui';
+import { Badge, Button, Callout, KindMark, PageHead, Skeleton, StatusCode } from '../components/ui';
 import { errorMessage } from '../lib/api';
 import { displayNames, missingKeyWarning } from '../lib/connections';
 import { formatCompact, formatDuration, formatMs, formatNumber, formatPercent, formatRelative, toMillis } from '../lib/format';
 import { resolveGatewayUrls } from '../lib/snippets';
 import type { Overview, Transport } from '../lib/types';
-import { ImportPanel } from './connections/ImportPanel';
+import { ConnectOptions } from './connections/ImportPanel';
+import { HealthChip } from './Connections';
 
 export function OverviewPage() {
   const overview = useOverview();
   const connections = useConnections();
   const keys = useKeys();
 
-  if (overview.isPending || connections.isPending) return <OverviewSkeleton />;
-  if (overview.isError) {
+  if (connections.isPending || (!overview.data && !overview.isError)) return <OverviewSkeleton />;
+  // With data in hand, a failed refresh keeps showing the last known state (see the shell's reconnect banner).
+  if (!overview.data) {
     return (
       <>
         <PageHead title="Overview" />
@@ -35,7 +37,8 @@ export function OverviewPage() {
   const steps = {
     connection: true,
     key: (keys.data?.length ?? 0) > 0,
-    traffic: o.requests_total > 0,
+    // Only a request that actually succeeded proves the gateway works end to end.
+    traffic: o.requests_success > 0,
   };
   const setupDone = steps.key && steps.traffic;
 
@@ -115,28 +118,10 @@ function FirstRun({ keysCount }: { keysCount: number }) {
           <div className="step-body">
             <div className="step-head">
               <h2>Connect an account</h2>
-              <span className="muted small">Use the subscriptions you already have, or an API key.</span>
+              <span className="muted small">Sign in with a subscription, reuse a CLI login, or add an API key.</span>
             </div>
-            <div className="card card-pad stack">
-              <ImportPanel />
-              <hr className="divider" />
-              <div className="stack-sm">
-                <h3>Add an API provider</h3>
-                <div className="provider-buttons">
-                  {(['openai', 'anthropic', 'gemini'] as const).map((k) => (
-                    <button key={k} type="button" className="provider-button" onClick={() => navigate(`/connections?new=1&preset=${k}`)}>
-                      <KindMark kind={k} size="sm" />
-                      {kindLabel(k)}
-                      <Plus aria-hidden className="muted" />
-                    </button>
-                  ))}
-                  <button type="button" className="provider-button" onClick={() => navigate('/connections?new=1&preset=compatible')}>
-                    <KindMark kind="openai" size="sm" />
-                    OpenAI-compatible
-                    <Plus aria-hidden className="muted" />
-                  </button>
-                </div>
-              </div>
+            <div className="card card-pad">
+              <ConnectOptions />
             </div>
           </div>
         </li>
@@ -183,7 +168,7 @@ function SetupStrip({ steps }: { steps: { connection: boolean; key: boolean; tra
   const items = [
     { done: steps.connection, label: 'Connect an account', to: '/connections', icon: Plug },
     { done: steps.key, label: 'Create a client key', to: '/keys?new=1', icon: KeyRound },
-    { done: steps.traffic, label: 'Send your first request', to: steps.key ? '/clients' : '/playground', icon: Zap },
+    { done: steps.traffic, label: 'Get a successful response', to: steps.key ? '/clients' : '/playground', icon: Zap },
   ];
   const remaining = items.filter((i) => !i.done).length;
   return (
@@ -386,7 +371,7 @@ function RecentCard({ o }: { o: Overview }) {
 }
 
 function HealthCard() {
-  const connections = useConnections();
+  const connections = useConnections({ health: true });
   const list = connections.data ?? [];
   const names = displayNames(list);
   return (
@@ -405,10 +390,14 @@ function HealthCard() {
             <span className="spacer" />
             {missingKeyWarning(c) ? <Badge tone="warn">No key</Badge> : null}
             {c.supports_websocket ? <Badge tone="info">WS</Badge> : null}
-            <span className={`health-state ${c.enabled ? 'on' : ''}`}>
-              <span className={`dot ${c.enabled ? 'dot-ok' : ''}`} aria-hidden />
-              {c.enabled ? 'Enabled' : 'Disabled'}
-            </span>
+            {c.health || !c.enabled ? (
+              <HealthChip connection={c} />
+            ) : (
+              <span className="health-state on">
+                <span className="dot dot-ok" aria-hidden />
+                Enabled
+              </span>
+            )}
           </li>
         ))}
         {list.length > 8 ? (

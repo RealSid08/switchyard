@@ -140,7 +140,7 @@ export function ClientsPage() {
           </div>
           {mismatch ? (
             <Callout tone="warn" icon={TriangleAlert}>
-              {guide.label} speaks the {guide.speaks === 'anthropic' ? 'Anthropic Messages' : 'OpenAI'} API, but <code>{model}</code> is served by {kindLabel(modelKind ?? '')}. Pick a matching model unless you’ve confirmed the gateway translates between these formats.
+              {guide.label} speaks the {guide.speaks === 'anthropic' ? 'Anthropic Messages' : guide.speaks === 'gemini' ? 'Gemini' : 'OpenAI'} API, but <code>{model}</code> is served by {kindLabel(modelKind ?? '')}. Pick a matching model unless you’ve confirmed the gateway translates between these formats.
             </Callout>
           ) : null}
           {guide.blocks.map((b) => (

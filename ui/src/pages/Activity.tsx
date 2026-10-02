@@ -1,13 +1,16 @@
-import { Activity as ActivityIcon, ArrowUpRight, Copy, FlaskConical, Lock, Pause, Play, RefreshCw, Search, X } from 'lucide-react';
+import { Activity as ActivityIcon, Copy, FlaskConical, Lock, Pause, Play, RefreshCw, Search, Shuffle, X } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '../lib/client';
+import { wasRetried } from '../lib/health';
+import { RequestDetail, servedModel } from './activity/RequestDetail';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useConnections, useRequests } from '../app/queries';
 import { Link, navigate, useLocation } from '../app/router';
-import { CopyButton } from '../components/Code';
 import { Dialog } from '../components/Dialog';
 import { Badge, Button, Callout, EmptyState, PageHead, Segmented, Skeleton, StatusCode } from '../components/ui';
 import { errorMessage } from '../lib/api';
 import { displayNames } from '../lib/connections';
-import { formatDateTime, formatMs, formatNumber, formatPercent, formatRelative, formatTime, outcome, statusCode } from '../lib/format';
+import { formatDateTime, formatMs, formatNumber, formatPercent, formatRelative, formatTime } from '../lib/format';
 import { filterRequests, filtersFromSearch, filtersToSearch, hasActiveFilters, summarize, type RequestFilters } from '../lib/requests';
 import type { RequestRecord, Transport } from '../lib/types';
 
@@ -63,7 +66,16 @@ export function ActivityPage({ selectedId }: { selectedId?: string }) {
   const stats = useMemo(() => summarize(rows), [rows]);
   const models = useMemo(() => [...new Set([...(requests.data ?? []).map((r) => r.model), filters.model].filter(Boolean))].sort(), [requests.data, filters.model]);
   const allRecords = requests.data ?? [];
-  const selected = selectedId ? (allRecords.find((r) => r.id === selectedId) ?? frozen?.find((r) => r.id === selectedId)) : undefined;
+  const cached = selectedId ? (allRecords.find((r) => r.id === selectedId) ?? frozen?.find((r) => r.id === selectedId)) : undefined;
+  // Deep links to records outside the loaded window come from the gateway (it keeps the last 1,000).
+  const detail = useQuery({
+    queryKey: ['request', selectedId],
+    queryFn: () => api.requestDetail(selectedId!),
+    enabled: !!selectedId && !cached && !requests.isPending,
+    retry: false,
+    staleTime: 60_000,
+  });
+  const selected = cached ?? detail.data;
   const filtered = hasActiveFilters(filters);
 
   return (
@@ -131,6 +143,10 @@ export function ActivityPage({ selectedId }: { selectedId?: string }) {
           <option value="sse">SSE</option>
           <option value="websocket">WebSocket</option>
         </select>
+        <button type="button" className={`filter-toggle ${filters.retried ? 'on' : ''}`} aria-pressed={filters.retried} onClick={() => setFilters({ retried: !filters.retried })}>
+          <Shuffle aria-hidden />
+          Retried
+        </button>
         {filtered ? (
           <Button
             variant="ghost"
@@ -156,7 +172,7 @@ export function ActivityPage({ selectedId }: { selectedId?: string }) {
             </div>
           ))}
         </div>
-      ) : requests.isError ? (
+      ) : requests.isError && !requests.data ? (
         <Callout tone="err" title="Couldn’t load activity" role="alert" action={<Button size="sm" icon={RefreshCw} onClick={() => requests.refetch()}>Retry</Button>}>
           {errorMessage(requests.error)}
         </Callout>
@@ -175,6 +191,11 @@ export function ActivityPage({ selectedId }: { selectedId?: string }) {
             <span>
               p95 <strong className="num">{formatMs(stats.p95)}</strong>
             </span>
+            {stats.retried ? (
+              <span title="Requests that failed over to another account or needed more than one attempt">
+                <strong className="num">{formatNumber(stats.retried)}</strong> retried
+              </span>
+            ) : null}
             <span className="spacer" />
             {!live ? <Badge tone="warn">Paused</Badge> : <Badge tone="ok">Live</Badge>}
           </div>
@@ -219,7 +240,7 @@ export function ActivityPage({ selectedId }: { selectedId?: string }) {
       )}
 
       <Dialog open={!!selectedId} onClose={() => navigate(`/activity${search}`)} sheet title="Request details" description={selected ? `${selected.model} · ${formatRelative(selected.timestamp)}` : undefined}>
-        {selected ? <RequestDetail r={selected} names={names} /> : <MissingRecord loading={requests.isPending} />}
+        {selected ? <RequestDetail r={selected} names={names} explain={explainStatus} /> : <MissingRecord loading={requests.isPending || detail.isFetching} />}
       </Dialog>
     </>
   );
@@ -270,10 +291,14 @@ function RequestTable({ rows, selectedId, names, search }: { rows: RequestRecord
                     </Link>
                   </td>
                   <td>
-                    <StatusCode record={r} />
+                    <span className="row" style={{ gap: 6 }}>
+                      <StatusCode record={r} />
+                      <RetriedMark r={r} />
+                    </span>
                   </td>
-                  <td className="mono cell-model" title={r.model}>
+                  <td className="mono cell-model" title={r.route ? `${r.model} (route) → ${servedModel(r)}` : r.model}>
                     {r.model}
+                    {r.route && servedModel(r) !== r.model ? <span className="muted served-as"> → {servedModel(r)}</span> : null}
                   </td>
                   <td className="cell-conn" title={r.connection_name ?? undefined}>
                     {(r.connection_id && names.get(r.connection_id)) || r.connection_name || <span className="muted">—</span>}
@@ -297,6 +322,7 @@ function RequestTable({ rows, selectedId, names, search }: { rows: RequestRecord
             <Link to={`/activity/${encodeURIComponent(r.id)}${search}`} className={`activity-card ${isFresh(r.id) ? 'fresh' : ''}`}>
               <div className="row">
                 <StatusCode record={r} />
+                <RetriedMark r={r} />
                 <span className="mono truncate">{r.model}</span>
                 <span className="spacer" />
                 <span className="num small">{formatMs(r.latency_ms)}</span>
@@ -324,68 +350,15 @@ function RequestTable({ rows, selectedId, names, search }: { rows: RequestRecord
   );
 }
 
-function RequestDetail({ r, names }: { r: RequestRecord; names: Map<string, string> }) {
-  const o = outcome(r);
-  const code = statusCode(r.status);
+function RetriedMark({ r }: { r: RequestRecord }) {
+  if (!wasRetried(r)) return null;
+  const label = r.failovers ? `${r.failovers} ${r.failovers === 1 ? 'failover' : 'failovers'}` : `${r.attempts?.length ?? 0} attempts`;
   return (
-    <div className="stack">
-      <div className={`detail-hero ${o}`}>
-        <StatusCode record={r} />
-        <span className="detail-hero-text">{o === 'success' ? 'Succeeded' : o === 'error' ? 'Failed' : 'In progress'}</span>
-        <span className="spacer" />
-        <span className="num">{formatMs(r.latency_ms)}</span>
-      </div>
-      {r.error ? (
-        <Callout tone="err" title="Error">
-          <span className="mono small" style={{ overflowWrap: 'anywhere' }}>
-            {r.error}
-          </span>
-        </Callout>
-      ) : null}
-      {o === 'error' ? <Callout tone="info">{explainStatus(code)}</Callout> : null}
-      <dl className="kv">
-        <dt>Time</dt>
-        <dd>{formatDateTime(r.timestamp)}</dd>
-        <dt>Model</dt>
-        <dd className="mono">{r.model}</dd>
-        <dt>Connection</dt>
-        <dd>
-          {r.connection_id && names.get(r.connection_id) ? (
-            <Link className="link" to={`/activity?connection=${encodeURIComponent(r.connection_id)}`}>
-              {names.get(r.connection_id)}
-            </Link>
-          ) : (
-            (r.connection_name ?? '—')
-          )}
-        </dd>
-        <dt>Transport</dt>
-        <dd>{TRANSPORT_LABEL[r.transport] ?? r.transport}</dd>
-        <dt>HTTP status</dt>
-        <dd className="num">{code ?? String(r.status)}</dd>
-        <dt>Latency</dt>
-        <dd className="num">{formatMs(r.latency_ms)}</dd>
-        <dt>Input tokens</dt>
-        <dd className="num">{formatNumber(r.input_tokens ?? null)}</dd>
-        <dt>Output tokens</dt>
-        <dd className="num">{formatNumber(r.output_tokens ?? null)}</dd>
-        <dt>Request ID</dt>
-        <dd className="row">
-          <span className="mono small truncate">{r.id}</span>
-          <CopyButton text={r.id} label="Copy request ID" />
-        </dd>
-      </dl>
-      <div className="row row-wrap">
-        <Button icon={FlaskConical} onClick={() => navigate(`/playground?model=${encodeURIComponent(r.model)}`)}>
-          Retry in playground
-        </Button>
-        <Button variant="ghost" icon={ArrowUpRight} onClick={() => navigate(`/activity?model=${encodeURIComponent(r.model)}`)}>
-          All requests for this model
-        </Button>
-      </div>
-      <p className="privacy-note">
-        <Lock aria-hidden /> Prompt and response bodies are never recorded, so they can’t be shown here.
-      </p>
-    </div>
+    <span className="retried-mark" title={label}>
+      <Shuffle aria-hidden />
+      <span className="sr-only">{label}</span>
+      {r.failovers || r.attempts?.length}
+    </span>
   );
 }
 
@@ -397,6 +370,8 @@ export function explainStatus(code: number | null): string {
       return 'Forbidden by the upstream provider. Check the account’s plan and model access.';
     case 404:
       return 'No enabled connection or route serves this model. Check the model name, or add it to a connection.';
+    case 424:
+      return 'The provider rejected this account’s credentials. Sign in again, re-import, or replace the key on Connections. Your Switchyard session is unaffected.';
     case 409:
       return 'A follow-up referenced a response created on another account that Switchyard no longer tracks (for example after a restart). Start a new conversation in the client.';
     case 429:

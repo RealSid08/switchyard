@@ -261,6 +261,33 @@ button.live-pill:hover {
   margin-left: auto;
 }
 
+.reconnect-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 32px;
+  border-bottom: 1px solid color-mix(in srgb, var(--err) 35%, transparent);
+  background: var(--err-soft);
+  font-size: var(--text-sm);
+}
+
+.reconnect-banner svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--err-text);
+}
+
+.reconnect-banner .btn {
+  margin-left: auto;
+}
+
+@media (max-width: 900px) {
+  .reconnect-banner {
+    padding: 9px 16px;
+  }
+}
+
 /* ---------- Mobile top bar ---------- */
 .topbar {
   display: none;

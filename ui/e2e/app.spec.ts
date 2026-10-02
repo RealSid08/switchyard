@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { expect, test } from '@playwright/test';
-import { ADMIN_TOKEN, MOCK_TOKEN, UI_TOKEN, expectAccessible, mock, watchConsole } from './helpers.ts';
+import { ADMIN_TOKEN, MOCK, MOCK_TOKEN, UI_TOKEN, expectAccessible, mock, watchConsole } from './helpers.ts';
 
 test.beforeEach(async () => {
   await mock('reset');
@@ -65,7 +65,7 @@ test('connections: validate, create, test, toggle, and delete safely out of rout
   await mock('seed');
   const c = watchConsole(page);
   await page.goto('/connections');
-  await page.getByRole('button', { name: 'Add connection' }).click();
+  await page.getByRole('button', { name: 'Add API key' }).click();
   const dialog = page.getByRole('dialog', { name: 'Add a connection' });
   await dialog.getByRole('radio', { name: /OpenAI-compatible/ }).click();
   await dialog.getByLabel('Base URL').fill('http://example.com/v1');
@@ -265,7 +265,10 @@ test('remote access: token sign-in, wrong-key hint, sign out', async ({ page }) 
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Three steps to your first routed request' })).toBeVisible();
   await page.goto(UI_TOKEN + '/settings');
-  await page.getByRole('button', { name: 'Forget token' }).click();
+  await page.getByRole('button', { name: 'Sign out of this browser' }).click();
+  await expect(page.getByRole('heading', { name: 'You’re signed out' })).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem('switchyard.admin-token'))).toBeNull();
+  await page.getByRole('button', { name: 'Sign in with a token' }).click();
   await expect(page.getByRole('heading', { name: 'Sign in to the control room' })).toBeVisible();
   c.allow(/status of 401/);
   c.assertClean();
@@ -319,4 +322,280 @@ test('production bundle contains no mock code', () => {
     expect(src).not.toContain('__mock');
     expect(src).not.toContain('Mock backend');
   }
+});
+
+
+/* ---------------- Browser sign-in (OAuth) ---------------- */
+
+async function openSignIn(page: import('@playwright/test').Page, provider: 'ChatGPT' | 'Claude') {
+  await page.goto('/connections?import=1');
+  await page.getByRole('button', { name: `Sign in with ${provider} in the browser` }).click();
+  const dialog = page.getByRole('dialog', { name: `Sign in with ${provider}` });
+  const link = dialog.getByRole('link', { name: 'Open sign-in page' });
+  await expect(link).toBeVisible();
+  const href = (await link.getAttribute('href')) ?? '';
+  const u = new URL(href);
+  return { dialog, link, id: u.searchParams.get('id') ?? '', state: u.searchParams.get('state') ?? '' };
+}
+
+async function flowStatus(id: string) {
+  const res = await fetch(`${MOCK}/api/oauth/${id}`, { headers: { authorization: `Bearer ${ADMIN_TOKEN}` } });
+  return (await res.json()) as { status: string; message?: string };
+}
+
+test('oauth: local browser sign-in completes automatically and shows ownership', async ({ page, context }) => {
+  const c = watchConsole(page);
+  const { dialog, link } = await openSignIn(page, 'ChatGPT');
+  await expect(dialog.getByText('Waiting for you to approve')).toBeVisible();
+  await expect(dialog.getByText(/expires in [45]:\d\d/)).toBeVisible();
+  await expectAccessible(page);
+  const [popup] = await Promise.all([context.waitForEvent('page'), link.click()]);
+  await popup.waitForLoadState();
+  await expect(popup.getByText('Signed in.')).toBeVisible();
+  await popup.close();
+  await expect(dialog.getByText('New account connected.')).toBeVisible();
+  await expect(page.locator('.toast', { hasText: 'Signed in: ChatGPT' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Done' }).click();
+  await page.keyboard.press('Escape');
+  const card = page.locator('.conn-card', { hasText: 'ChatGPT · you@example.com' });
+  await expect(card).toBeVisible();
+  await expect(card.locator('.conn-source')).toContainText('Browser sign-in · refreshed by Switchyard');
+
+  // Signing in again with the same account refreshes it rather than duplicating.
+  await card.getByRole('button', { name: /More actions/ }).click();
+  await page.getByRole('menuitem', { name: 'Sign in again' }).click();
+  const again = page.getByRole('dialog', { name: 'Sign in with ChatGPT' });
+  const [popup2] = await Promise.all([context.waitForEvent('page'), again.getByRole('link', { name: 'Open sign-in page' }).click()]);
+  await popup2.close();
+  await expect(again.getByText('Existing account refreshed.')).toBeVisible();
+  await again.getByRole('button', { name: 'Done' }).click();
+  await expect(page.locator('.conn-card', { hasText: 'ChatGPT · you@example.com' })).toHaveCount(1);
+  c.assertClean();
+});
+
+test('oauth: remote browser pastes the callback address (wrong state first, then right)', async ({ page }) => {
+  const c = watchConsole(page);
+  const { dialog, id, state } = await openSignIn(page, 'ChatGPT');
+  await dialog.getByText('Signing in from a different computer').click();
+  const field = dialog.getByLabel('Callback address');
+  await field.fill('localhost:1455/auth/callback');
+  await dialog.getByRole('button', { name: 'Finish' }).click();
+  await expect(dialog.getByText('Paste the full callback address', { exact: false })).toBeVisible();
+  await field.fill(`http://localhost:1455/auth/callback?code=mockcode&state=not-${state}`);
+  await dialog.getByRole('button', { name: 'Finish' }).click();
+  await expect(dialog.getByText('belongs to a different sign-in', { exact: false })).toBeVisible();
+  expect((await flowStatus(id)).status).toBe('pending');
+  await field.fill(`http://localhost:1455/auth/callback?code=work-account&state=${state}`);
+  await dialog.getByRole('button', { name: 'Finish' }).click();
+  await expect(dialog.getByText('ChatGPT · work-account')).toBeVisible();
+  c.allow(/status of 400/);
+  c.assertClean();
+});
+
+test('oauth: Claude accepts code#state', async ({ page }) => {
+  const { dialog, state } = await openSignIn(page, 'Claude');
+  await dialog.getByText('Signing in from a different computer').click();
+  await dialog.getByLabel('Callback address').fill(`team-account#${state}`);
+  await dialog.getByRole('button', { name: 'Finish' }).click();
+  await expect(dialog.getByText('Claude · team-account')).toBeVisible();
+});
+
+test('oauth: expiry offers a fresh start', async ({ page }) => {
+  await fetch(`${MOCK}/api/__mock/oauth-ttl?seconds=2`, { method: 'POST' });
+  const { dialog } = await openSignIn(page, 'ChatGPT');
+  await expect(dialog.getByRole('alert').filter({ hasText: 'Sign-in expired' })).toBeVisible({ timeout: 10_000 });
+  await fetch(`${MOCK}/api/__mock/oauth-ttl?seconds=300`, { method: 'POST' });
+  await dialog.getByRole('button', { name: 'Try again' }).click();
+  await expect(dialog.getByRole('link', { name: 'Open sign-in page' })).toBeVisible();
+});
+
+test('oauth: closing the dialog cancels the pending sign-in', async ({ page }) => {
+  const { dialog, id } = await openSignIn(page, 'Claude');
+  await dialog.getByRole('button', { name: 'Cancel sign-in' }).click();
+  await expect(dialog).toBeHidden();
+  await expect.poll(async () => (await flowStatus(id)).message).toBe('Sign-in cancelled.');
+  // Escape cancels too.
+  const second = await openSignIn(page, 'Claude');
+  await page.keyboard.press('Escape');
+  await expect.poll(async () => (await flowStatus(second.id)).status).toBe('error');
+});
+
+test('oauth: busy callback port explains itself and retries', async ({ page }) => {
+  await mock('oauth-busy');
+  await page.goto('/connections?import=1');
+  await page.getByRole('button', { name: 'Sign in with ChatGPT in the browser' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Sign in with ChatGPT' });
+  await expect(dialog.getByRole('alert')).toContainText('Sign-in port is busy');
+  await expect(dialog.getByRole('alert')).toContainText('1455');
+  await mock('oauth-free');
+  await dialog.getByRole('button', { name: 'Try again' }).click();
+  await expect(dialog.getByRole('link', { name: 'Open sign-in page' })).toBeVisible();
+});
+
+test('connections show credential source and source-appropriate recovery', async ({ page }) => {
+  await mock('seed');
+  await page.goto('/connections');
+  await expect(page.locator('.conn-card', { hasText: 'Claude Code' }).locator('.conn-source')).toContainText('Claude Code login · follows the CLI login');
+  await expect(page.locator('.conn-card', { hasText: 'Gemini' }).locator('.conn-source')).toContainText('API key');
+  const native = page.locator('.conn-card').filter({ has: page.locator('.conn-source', { hasText: 'Codex CLI login' }) });
+  await native.getByRole('button', { name: /More actions/ }).click();
+  await expect(page.getByRole('menuitem', { name: 'Re-import from Codex CLI' })).toBeVisible();
+  await expect(page.getByRole('menuitem', { name: 'Use a browser sign-in instead' })).toBeVisible();
+  await page.getByRole('menuitem', { name: 'Re-import from Codex CLI' }).click();
+  await expect(page.locator('.toast', { hasText: 'Re-imported' })).toBeVisible();
+  // Nothing on the page reveals a filesystem path for a credential.
+  await expect(page.locator('.conn-list')).not.toContainText('/.codex/');
+});
+
+test('local sign out is honest and one click to undo', async ({ page }) => {
+  await mock('seed');
+  await page.goto('/settings');
+  await page.getByRole('button', { name: 'Sign out of this browser' }).click();
+  await expect(page.getByRole('heading', { name: 'You’re signed out' })).toBeVisible();
+  await expect(page.getByText('reloading the page will also sign you in automatically', { exact: false })).toBeVisible();
+  // The old cookie no longer works.
+  const status = await page.evaluate(async () => (await fetch('/api/overview', { credentials: 'include' })).status);
+  expect(status).toBe(401);
+  await page.getByRole('button', { name: 'Sign in again' }).click();
+  // Back where you were, with a fresh session.
+  await expect(page.getByRole('heading', { name: 'Settings', level: 1 })).toBeVisible();
+  await expect(page.getByText('Accepting traffic').first()).toBeVisible();
+});
+
+test('gateway outage keeps the last data and recovers without a reload', async ({ page }) => {
+  await mock('seed');
+  await page.goto('/connections');
+  await expect(page.locator('.conn-card').first()).toBeVisible();
+  await page.route('**/api/**', (r) => r.abort('connectionrefused'));
+  await mock('drop-events');
+  await expect(page.getByText('Can’t reach the gateway.', { exact: false })).toBeVisible({ timeout: 25_000 });
+  await expect(page.locator('.conn-card').first()).toBeVisible();
+  await expect(page.getByText('Couldn’t load connections')).toHaveCount(0);
+  await page.unroute('**/api/**');
+  await page.getByRole('button', { name: 'Retry now' }).click();
+  await expect(page.getByText('Can’t reach the gateway.', { exact: false })).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.locator('.sidebar .live-pill')).toHaveText(/Live/, { timeout: 15_000 });
+});
+
+/* ---------------- Model discovery, health, attempts, Gemini ---------------- */
+
+test('model discovery: choose from the provider catalog and save', async ({ page }) => {
+  await mock('seed');
+  const c = watchConsole(page);
+  await page.goto('/connections');
+  const card = page.locator('.conn-card', { hasText: 'Claude Code' });
+  await card.getByRole('button', { name: /More actions/ }).click();
+  await page.getByRole('menuitem', { name: 'Choose models…' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Models for Claude Code' });
+  await expect(dialog.getByText('8 offered by the provider')).toBeVisible();
+  await expectAccessible(page);
+  await dialog.getByLabel('Filter models').fill('haiku');
+  await dialog.getByRole('checkbox', { name: /claude-haiku-4-5/ }).check();
+  await dialog.getByLabel('Filter models').fill('');
+  // Removing a model a route depends on warns first.
+  await dialog.getByRole('checkbox', { name: /claude-opus-5-5/ }).uncheck();
+  await expect(dialog.getByText(/leaves route/)).toContainText('coding');
+  await dialog.getByRole('checkbox', { name: /claude-opus-5-5/ }).check();
+  await dialog.getByRole('button', { name: 'Save 3 models' }).click();
+  await expect(page.locator('.toast', { hasText: 'Saved 3 models' })).toBeVisible();
+  await expect(card.locator('.model-chip', { hasText: 'claude-haiku-4-5' })).toBeVisible();
+  c.assertClean();
+});
+
+test('model discovery: rejected credential is explained without signing out', async ({ page }) => {
+  await mock('seed');
+  await mock('catalog-reject');
+  await page.goto('/connections?models=' + (await firstConnectionId(page, 'Gemini')));
+  const dialog = page.getByRole('dialog', { name: 'Models for Gemini' });
+  await expect(dialog.getByRole('alert')).toContainText('The provider rejected this account’s credentials');
+  await expect(dialog.getByRole('alert')).toContainText('Replace the API key');
+  await expect(page.getByRole('heading', { name: 'Sign in to the control room' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'You’re signed out' })).toHaveCount(0);
+  await mock('catalog-accept');
+  await dialog.getByRole('button', { name: 'Retry' }).click();
+  await expect(dialog.getByText('Only part of the catalog', { exact: false }).or(dialog.getByText('could only be read in part', { exact: false }))).toBeVisible();
+});
+
+async function firstConnectionId(page: import('@playwright/test').Page, name: string) {
+  await page.goto('/connections');
+  return page.evaluate(async (n) => {
+    const list = (await (await fetch('/api/connections')).json()) as { id: string; name: string }[];
+    return list.find((c) => c.name === n)?.id ?? '';
+  }, name);
+}
+
+test('model discovery from the edit sheet fills the form', async ({ page }) => {
+  await mock('seed');
+  await page.goto('/connections');
+  const card = page.locator('.conn-card').filter({ has: page.locator('.conn-source', { hasText: 'Codex CLI login' }) });
+  await card.getByRole('button', { name: /More actions/ }).click();
+  await page.getByRole('menuitem', { name: 'Edit' }).click();
+  const sheet = page.getByRole('dialog', { name: /^Edit / });
+  await sheet.getByRole('button', { name: 'Browse provider models' }).click();
+  const picker = page.getByRole('dialog', { name: /^Models for/ });
+  await picker.getByRole('checkbox', { name: /gpt-6-nova/ }).check();
+  await picker.getByRole('button', { name: 'Use 4 models' }).click();
+  await expect(sheet.getByRole('button', { name: 'Remove gpt-6-nova' })).toBeVisible();
+});
+
+test('connection health: limited, cooling down, and expiring CLI logins', async ({ page }) => {
+  await mock('seed');
+  await page.goto('/connections');
+  const oauth = page.locator('.conn-card').filter({ has: page.locator('.conn-source', { hasText: 'Browser sign-in' }) });
+  await expect(oauth.locator('.health-chip')).toHaveText(/Limited/);
+  await expect(oauth.locator('.cooldowns')).toContainText('gpt-6.1-sol');
+  await expect(oauth.locator('.cooldowns')).toContainText(/back in\s*1m/);
+  const cli = page.locator('.conn-card').filter({ has: page.locator('.conn-source', { hasText: 'Codex CLI login' }) });
+  await expect(cli.locator('.conn-expiry')).toContainText('Login expires in 5 h');
+  await expect(page.locator('.conn-card', { hasText: 'Gemini' }).locator('.health-chip')).toHaveText(/Ready/);
+  await expect(page.locator('.conn-card', { hasText: 'Ollama' }).locator('.health-chip')).toHaveText(/Disabled/);
+  await mock('cooldown');
+  await page.reload();
+  await expect(oauth.locator('.health-chip')).toHaveText(/Cooling down/);
+  await expect(oauth.locator('.cooldowns')).toContainText('All models');
+  // Routes show the benched target too.
+  await page.goto('/routes');
+  await expect(page.locator('.route-card', { hasText: 'coding' })).toContainText('account cooling');
+});
+
+test('activity: failovers, attempts and gateway timing', async ({ page }) => {
+  await mock('seed');
+  const c = watchConsole(page);
+  await page.goto('/activity');
+  await page.getByRole('button', { name: 'Retried' }).click();
+  await expect(page).toHaveURL(/retried=1/);
+  const rows = page.locator('.activity-table tbody tr');
+  await expect(rows.first()).toBeVisible();
+  expect(await rows.count()).toBe(await page.locator('.activity-table tbody .retried-mark').count());
+  await rows.first().locator('a').click();
+  const sheet = page.getByRole('dialog', { name: 'Request details' });
+  await expect(sheet.getByRole('region', { name: 'Upstream attempts' })).toBeVisible();
+  await expect(sheet.getByRole('region', { name: 'Upstream attempts' })).toContainText('failover');
+  await expect(sheet.getByRole('region', { name: 'Upstream attempts' })).toContainText(/Rate limited|Provider unavailable/);
+  await expect(sheet.getByRole('region', { name: 'Gateway timing' })).toContainText('Measured by the gateway');
+  await expect(sheet.getByText('route', { exact: true })).toBeVisible();
+  await expectAccessible(page);
+  c.assertClean();
+});
+
+test('activity: deep links fall back to the gateway, and expired records say so', async ({ page }) => {
+  await mock('seed');
+  const id = await page.goto('/').then(() =>
+    page.evaluate(async () => ((await (await fetch('/api/requests?limit=500')).json()) as { id: string }[]).at(-1)!.id),
+  );
+  // Pretend the list window doesn't include it.
+  await page.route('**/api/requests?*', (r) => r.fulfill({ status: 200, contentType: 'application/json', body: '[]' }));
+  await page.goto(`/activity/${id}`);
+  await expect(page.getByRole('dialog', { name: 'Request details' }).getByText(id)).toBeVisible();
+  await page.goto('/activity/does-not-exist');
+  await expect(page.getByRole('dialog', { name: 'Request details' }).getByText('Not in the recent log')).toBeVisible();
+});
+
+test('clients: Gemini SDK setup uses x-goog-api-key', async ({ page }) => {
+  await mock('seed');
+  await page.goto('/clients?client=gemini');
+  await expect(page.getByRole('tab', { name: 'Gemini' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('pre').filter({ hasText: 'google.genai' })).toContainText('base_url=');
+  await expect(page.locator('pre').filter({ hasText: 'streamGenerateContent' })).toContainText('x-goog-api-key');
+  await expect(page.getByText('hasn’t been verified against a live Gemini account', { exact: false })).toBeVisible();
 });

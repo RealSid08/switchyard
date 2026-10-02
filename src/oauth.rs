@@ -9,6 +9,7 @@
 use crate::{
     app::{ApiError, App},
     credentials::{self, Parsed, SOURCE_OAUTH},
+    store::Connection,
 };
 use axum::{
     Router,
@@ -73,6 +74,13 @@ const TTL: Duration = Duration::from_secs(300);
 const MAX_PENDING: usize = 8;
 const MAX_FLOWS: usize = 64;
 const KEEP_FINISHED: Duration = Duration::from_secs(600);
+/// Upper bound on completing a sign-in once the provider redirected back: token exchange (20 s),
+/// profile lookup (10 s) and the account lock (25 s), with margin. Past it the flow expires.
+const EXCHANGE_LIMIT: Duration = Duration::from_secs(60);
+const CANCELLED: &str = "Sign-in cancelled.";
+const EXPIRED: &str = "Sign-in expired. Start again from the control room.";
+const ENDED: &str = "This sign-in already ended. Start again from the control room.";
+const SAVE_FAILED: &str = "Signed in, but the account could not be saved. Start again.";
 const MAX_RESPONSE: usize = 256 * 1024;
 
 #[derive(Clone, Default)]
@@ -104,7 +112,7 @@ pub fn set_test_endpoints(
         );
     }
 }
-/// Test hook: shorten the authorization TTL.
+/// Test hook: shorten the authorization TTL and the exchange limit.
 #[doc(hidden)]
 pub fn set_test_ttl(ttl: Option<Duration>) {
     *TTL_OVERRIDE.lock().expect("oauth ttl") = ttl;
@@ -125,6 +133,13 @@ fn token_url(p: &Provider) -> String {
 }
 fn profile_url(p: &Provider) -> String {
     over(p).profile_url.unwrap_or_else(|| p.profile_url.into())
+}
+/// The exchange deadline; a test TTL override shortens it too so expiry races are testable.
+fn exchange_limit() -> Duration {
+    TTL_OVERRIDE
+        .lock()
+        .expect("oauth ttl")
+        .unwrap_or(EXCHANGE_LIMIT)
 }
 fn ttl() -> Duration {
     TTL_OVERRIDE.lock().expect("oauth ttl").unwrap_or(TTL)
@@ -155,6 +170,16 @@ impl Flow {
     fn active(&self) -> bool {
         matches!(self.phase, Phase::Pending | Phase::Exchanging)
     }
+    /// The answer for a callback that arrives after the flow ended: its final outcome, not a
+    /// state mismatch. `Ok` only for a completed sign-in.
+    fn final_outcome(&self) -> Result<(), Failure> {
+        match self.phase {
+            Phase::Complete => Ok(()),
+            Phase::Expired => Err((410, self.message.unwrap_or(EXPIRED))),
+            Phase::Error => Err((409, self.message.unwrap_or(ENDED))),
+            Phase::Pending | Phase::Exchanging => Err((409, ENDED)),
+        }
+    }
     fn finish(&mut self, phase: Phase, message: Option<&'static str>) {
         self.phase = phase;
         self.message = message;
@@ -169,11 +194,8 @@ static FLOWS: LazyLock<Mutex<HashMap<String, Flow>>> = LazyLock::new(Default::de
 fn prune(flows: &mut HashMap<String, Flow>) {
     let now = Instant::now();
     for f in flows.values_mut() {
-        if f.phase == Phase::Pending && f.expires <= now {
-            f.finish(
-                Phase::Expired,
-                Some("Sign-in expired. Start again from the control room."),
-            );
+        if f.active() && f.expires <= now {
+            f.finish(Phase::Expired, Some(EXPIRED));
         }
     }
     flows.retain(|_, f| {
@@ -337,17 +359,31 @@ pub async fn start(app: App, provider_name: &str) -> Result<Value, ApiError> {
                 .await;
         });
     }
+    // Expires the flow at its deadline, which an exchange may extend (see EXCHANGE_LIMIT).
+    // Expiry signals `stop`, which also aborts an exchange still in flight.
     let flow_id = id.clone();
     let mut rx = stop_rx;
     tokio::spawn(async move {
-        tokio::select! {
-            _ = tokio::time::sleep(ttl) => {
-                let mut flows = FLOWS.lock().expect("oauth flows");
-                if let Some(f) = flows.get_mut(&flow_id) && f.phase == Phase::Pending {
-                    f.finish(Phase::Expired, Some("Sign-in expired. Start again from the control room."));
+        loop {
+            let deadline = {
+                let flows = FLOWS.lock().expect("oauth flows");
+                match flows.get(&flow_id) {
+                    Some(f) if f.active() => f.expires,
+                    _ => return,
                 }
+            };
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline.into()) => {}
+                _ = rx.wait_for(|stopped| *stopped) => return,
             }
-            _ = rx.wait_for(|stopped| *stopped) => {}
+            let mut flows = FLOWS.lock().expect("oauth flows");
+            if let Some(f) = flows.get_mut(&flow_id)
+                && f.active()
+                && f.expires <= Instant::now()
+            {
+                f.finish(Phase::Expired, Some(EXPIRED));
+                return;
+            }
         }
     });
     tracing::info!(provider = p.key, "Browser sign-in started");
@@ -397,15 +433,17 @@ pub fn status(app: &App, id: &str) -> Result<Value, ApiError> {
     Ok(v)
 }
 
-/// Cancels a pending sign-in and releases its callback port.
+/// Cancels a sign-in that has not finished, including one whose token exchange or account save
+/// is in flight, and releases its callback port. Linearizable with completion: if the account was
+/// already saved the sign-in stays complete; otherwise nothing is saved afterwards.
 pub fn cancel(app: &App, id: &str) -> Result<Value, ApiError> {
     status(app, id)?;
     {
         let mut flows = FLOWS.lock().expect("oauth flows");
         if let Some(f) = flows.get_mut(id)
-            && f.phase == Phase::Pending
+            && f.active()
         {
-            f.finish(Phase::Error, Some("Sign-in cancelled."));
+            f.finish(Phase::Error, Some(CANCELLED));
         }
     }
     status(app, id)
@@ -503,30 +541,23 @@ async fn complete(app: &App, id: &str, q: &HashMap<String, String>) -> Result<()
         .map(String::as_str)
         .or(fragment_state)
         .unwrap_or("");
-    let (p, verifier, redirect_uri, expected) = {
+    let (p, verifier, redirect_uri, expected, mut stopped) = {
         let mut flows = FLOWS.lock().expect("oauth flows");
         prune(&mut flows);
         let f = flows.get_mut(id).ok_or(GONE)?;
         if !f.owner.ptr_eq(&std::sync::Arc::downgrade(app)) {
             return Err(GONE);
         }
+        // An ended sign-in reports how it ended (it holds no secrets and accepts nothing).
+        if !f.active() {
+            return f.final_outcome();
+        }
         let matches = |s: &str| !s.is_empty() && bool::from(s.as_bytes().ct_eq(f.state.as_bytes()));
         if !matches(state) || fragment_state.is_some_and(|s| !matches(s)) {
             return Err(MISMATCH);
         }
-        match f.phase {
-            Phase::Pending => {}
-            Phase::Complete => return Ok(()),
-            Phase::Exchanging => return Err((409, "This sign-in is already being completed.")),
-            Phase::Expired => {
-                return Err((410, "Sign-in expired. Start again from the control room."));
-            }
-            Phase::Error => {
-                return Err((
-                    409,
-                    "This sign-in already ended. Start again from the control room.",
-                ));
-            }
+        if f.phase == Phase::Exchanging {
+            return Err((409, "This sign-in is already being completed."));
         }
         if q.contains_key("error") {
             f.finish(
@@ -543,36 +574,59 @@ async fn complete(app: &App, id: &str, q: &HashMap<String, String>) -> Result<()
             return Err((400, "The provider returned an invalid sign-in response."));
         }
         f.phase = Phase::Exchanging;
+        f.expires = f.expires.max(Instant::now() + exchange_limit());
         (
             f.provider,
             std::mem::take(&mut f.verifier),
             f.redirect_uri.clone(),
             f.state.clone(),
+            f.stop.subscribe(),
         )
     };
-    let result = match exchange(app, p, code, &verifier, &redirect_uri, &expected, id).await {
-        Ok(parsed) => credentials::upsert(app, parsed)
+    // Exchange and save, abandoned as soon as the flow is cancelled, replaced or expires: the
+    // token request and any account-lock wait are dropped rather than run to completion.
+    let work = async {
+        let parsed = exchange(app, p, code, &verifier, &redirect_uri, &expected, id).await?;
+        credentials::upsert_gated(app, parsed, |write| commit(id, write))
             .await
-            .map_err(|_| "Signed in, but the account could not be saved. Start again."),
-        Err(e) => Err(e),
+            .map_err(|_| SAVE_FAILED)
     };
-    let mut flows = FLOWS.lock().expect("oauth flows");
-    let f = flows.get_mut(id);
-    match (result, f) {
-        (Ok(c), Some(f)) => {
-            f.connection = Some(c.public());
-            f.finish(Phase::Complete, None);
-            tracing::info!(provider = p.key, "Browser sign-in completed");
-            Ok(())
-        }
-        (Ok(_), None) => Ok(()),
-        (Err(m), f) => {
-            if let Some(f) = f {
-                f.finish(Phase::Error, Some(m));
-            }
-            Err((502, m))
-        }
+    let outcome = tokio::select! {
+        biased;
+        result = work => Some(result),
+        _ = stopped.wait_for(|stopped| *stopped) => None,
+    };
+    if let Some(Ok(_)) = outcome {
+        tracing::info!(provider = p.key, "Browser sign-in completed");
+        return Ok(());
     }
+    let mut flows = FLOWS.lock().expect("oauth flows");
+    let Some(f) = flows.get_mut(id) else {
+        return Err(GONE);
+    };
+    match outcome {
+        // Still ours to end: the exchange or save failed.
+        Some(Err(message)) if f.phase == Phase::Exchanging => {
+            f.finish(Phase::Error, Some(message));
+            Err((502, message))
+        }
+        // Cancelled, replaced, expired, or (in a lost race) completed: report the final outcome.
+        _ => f.final_outcome(),
+    }
+}
+
+/// Commit point of a browser sign-in. Runs the account write only while the flow is still
+/// exchanging, and marks it complete under the same lock, so completion and cancellation or
+/// expiry are mutually exclusive. The store write is synchronous; nothing awaits under the lock.
+fn commit(id: &str, write: credentials::Write<'_>) -> Result<Connection, ApiError> {
+    let mut flows = FLOWS.lock().expect("oauth flows");
+    let Some(f) = flows.get_mut(id).filter(|f| f.phase == Phase::Exchanging) else {
+        return Err(ApiError::new(409, ENDED));
+    };
+    let c = write()?;
+    f.connection = Some(c.public());
+    f.finish(Phase::Complete, None);
+    Ok(c)
 }
 
 const UNREACHABLE: &str =

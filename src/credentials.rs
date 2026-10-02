@@ -551,11 +551,26 @@ fn patch_tokens(c: &mut Connection, p: &Parsed) {
     c.account_identity = p.identity.clone();
 }
 
+/// The final store write of [`upsert_gated`], handed to its gate.
+pub(crate) type Write<'a> = &'a mut dyn FnMut() -> Result<Connection, ApiError>;
+
 /// Inserts or updates the connection for a parsed credential. User configuration (name, enabled,
 /// base URL, WebSocket support, models) on an existing connection always wins.
 pub(crate) async fn upsert(app: &App, p: Parsed) -> Result<Connection, ApiError> {
+    upsert_gated(app, p, |write| write()).await
+}
+
+/// [`upsert`] with a commit gate. All waiting (the per-account lock) happens first; then `gate`
+/// is called with the store write and decides synchronously whether to run it. Nothing awaits
+/// between the gate's decision and the write, so a caller can make the write atomic with its own
+/// state, for example a browser sign-in that may be cancelled while the account lock is awaited.
+/// A gate that refuses returns its own error and nothing is written.
+pub(crate) async fn upsert_gated<G>(app: &App, p: Parsed, gate: G) -> Result<Connection, ApiError>
+where
+    G: FnOnce(Write<'_>) -> Result<Connection, ApiError>,
+{
     let Some(old) = find_existing(app, &p) else {
-        let c = Connection {
+        let mut c = Connection {
             id: id(),
             name: p.name.chars().take(100).collect(),
             kind: p.kind.into(),
@@ -573,12 +588,13 @@ pub(crate) async fn upsert(app: &App, p: Parsed) -> Result<Connection, ApiError>
             source_path: String::new(),
             account_identity: String::new(),
         };
-        let mut c = c;
         patch_tokens(&mut c, &p);
-        app.store
-            .put("connection", &c.id, &c)
-            .map_err(ApiError::db)?;
-        return Ok(c);
+        return gate(&mut || {
+            app.store
+                .put("connection", &c.id, &c)
+                .map_err(ApiError::db)?;
+            Ok(c.clone())
+        });
     };
     let _guard = lock_account(app, &old.id).await?;
     // Reread under the lock so a concurrent refresh or edit is not overwritten.
@@ -588,17 +604,22 @@ pub(crate) async fn upsert(app: &App, p: Parsed) -> Result<Connection, ApiError>
             "The matching connection was removed during import. Retry.",
         ));
     };
-    if p.source == SOURCE_OAUTH || !keeps_newer_tokens(&latest, &p) {
+    let replace = p.source == SOURCE_OAUTH || !keeps_newer_tokens(&latest, &p);
+    if replace {
         patch_tokens(&mut latest, &p);
-        app.store
-            .put("connection", &latest.id, &latest)
-            .map_err(ApiError::db)?;
-        app.resilience
-            .lock()
-            .expect("resilience lock")
-            .reset(&latest.id);
     }
-    Ok(latest)
+    gate(&mut || {
+        if replace {
+            app.store
+                .put("connection", &latest.id, &latest)
+                .map_err(ApiError::db)?;
+            app.resilience
+                .lock()
+                .expect("resilience lock")
+                .reset(&latest.id);
+        }
+        Ok(latest.clone())
+    })
 }
 
 /// True when the stored tokens should survive an import from a shared source.

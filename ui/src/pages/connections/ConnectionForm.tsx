@@ -1,4 +1,6 @@
-import { Eye, EyeOff, KeyRound, Lock } from 'lucide-react';
+import { Eye, EyeOff, KeyRound, ListChecks, Lock } from 'lucide-react';
+import { navigate } from '../../app/router';
+import { ModelPickerDialog } from './ModelPicker';
 import { useMemo, useState, type FormEvent } from 'react';
 import { useSaveConnection } from '../../app/queries';
 import { Dialog } from '../../components/Dialog';
@@ -62,6 +64,7 @@ function ConnectionForm({ connection, initialPreset, onDone, onBusy }: { connect
   );
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
+  const [picking, setPicking] = useState(false);
   const [errors, setErrors] = useState<ConnectionErrors>({});
   const [serverError, setServerError] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
@@ -128,6 +131,9 @@ function ConnectionForm({ connection, initialPreset, onDone, onBusy }: { connect
               tone: r.ok ? 'ok' : 'err',
               title: r.ok ? `${saved.name} is ready` : `${saved.name} saved, but the check failed`,
               message: r.ok ? `Provider reachable in ${Math.round(r.latency_ms ?? 0)} ms.` : `${r.message}${r.status ? ` (HTTP ${r.status})` : ''}`,
+              // New connections: offer the provider's real model list right away.
+              action: r.ok && !editing ? { label: 'Choose models from the provider', onClick: () => navigate(`/connections?models=${encodeURIComponent(saved.id)}`) } : undefined,
+              duration: r.ok && !editing ? 9000 : undefined,
             }),
           )
           .catch(() => toast({ tone: 'ok', title: editing ? 'Connection updated' : 'Connection added', message: saved.name }));
@@ -269,7 +275,18 @@ function ConnectionForm({ connection, initialPreset, onDone, onBusy }: { connect
         label="Models"
         htmlFor="conn-models"
         error={errors.models}
-        hint="Exact upstream model IDs. Clients can request these directly, or you can map friendlier names in Routes. Paste a comma-separated list to add many."
+        aside={
+          connection ? (
+            <Button size="sm" variant="ghost" icon={ListChecks} onClick={() => setPicking(true)}>
+              Browse provider models
+            </Button>
+          ) : null
+        }
+        hint={
+          connection
+            ? 'Exact upstream model IDs. Browse uses the saved credential and URL; save first if you changed them. Paste a comma-separated list to add many.'
+            : 'Exact upstream model IDs. After saving you can browse the provider’s catalog. Paste a comma-separated list to add many.'
+        }
       >
         <TagInput
           id="conn-models"
@@ -323,6 +340,13 @@ function ConnectionForm({ connection, initialPreset, onDone, onBusy }: { connect
         </Callout>
       ) : null}
 
+      <ModelPickerDialog
+        connection={picking ? connection : null}
+        selected={form.models}
+        mode="apply"
+        onApply={(models) => update({ models })}
+        onClose={() => setPicking(false)}
+      />
       <div className="form-actions">
         <Button onClick={onDone} disabled={save.isPending}>
           Cancel

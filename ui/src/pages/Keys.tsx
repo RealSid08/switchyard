@@ -41,7 +41,7 @@ export function KeysPage() {
             </div>
           ))}
         </div>
-      ) : keys.isError ? (
+      ) : keys.isError && !keys.data ? (
         <Callout tone="err" title="Couldn’t load keys" role="alert" action={<Button size="sm" icon={RefreshCw} onClick={() => keys.refetch()}>Retry</Button>}>
           {errorMessage(keys.error)}
         </Callout>

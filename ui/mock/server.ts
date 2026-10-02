@@ -26,6 +26,9 @@ interface Conn {
   supports_websocket: boolean;
   created_at: string;
   secret: string;
+  source: 'api_key' | 'native_codex' | 'native_claude' | 'cliproxy' | 'oauth';
+  /** Unix seconds the credential expires, if known. */
+  expires?: number;
 }
 interface Route {
   model: string;
@@ -44,6 +47,11 @@ interface Rec {
   input_tokens: number | null;
   output_tokens: number | null;
   error: string | null;
+  route?: string | null;
+  failovers?: number;
+  attempts?: { connection_id: string; connection_name: string; model: string; status: number; duration_ms: number; error: string | null }[];
+  ttfb_ms?: number | null;
+  first_token_ms?: number | null;
 }
 interface Key {
   id: string;
@@ -58,7 +66,8 @@ export const ADMIN_TOKEN = 'sy_admin_mockmockmockmockmockmock';
 export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boolean } = {}) {
   const authMode = opts.auth ?? 'cookie';
   const started = Date.now();
-  let session = randomUUID();
+  // One entry per browser session, like the gateway (DELETE /api/session ends just one).
+  const sessions = new Set<string>();
   let connections: Conn[] = [];
   let routes: Route[] = [];
   let keys: Key[] = [];
@@ -73,7 +82,81 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   const eventSockets = new Set<WebSocket>();
 
   const now = () => new Date().toISOString();
-  const publicConn = ({ secret, ...c }: Conn) => ({ ...c, credential_present: secret.length > 0 });
+  /** Cooldowns per connection: model ("*" = whole account) until a wall-clock time. */
+  const cooldowns = new Map<string, { model: string; until: number }[]>();
+  let catalogReject = false;
+  const health = (c: Conn) => {
+    const now = Date.now();
+    const active = (cooldowns.get(c.id) ?? []).filter((x) => x.until > now);
+    const last = requests.find((r) => r.connection_id === c.id);
+    return {
+      status: !c.enabled ? 'disabled' : active.some((x) => x.model === '*') ? 'cooling' : active.length ? 'limited' : 'ready',
+      cooldowns: active.map((x) => ({ model: x.model, retry_after_seconds: Math.ceil((x.until - now) / 1000) })),
+      last_used_at: last?.timestamp ?? null,
+      last_status: last?.status ?? null,
+      last_error: last?.error ? (last.attempts?.at(-1)?.error ?? last.error) : null,
+    };
+  };
+  const publicConn = ({ secret, source, expires, ...c }: Conn) => ({
+    ...c,
+    credential_present: secret.length > 0,
+    credential_source: source,
+    credential_expires_at: expires ?? null,
+    health: health({ ...c, secret, source }),
+  });
+
+  /* ---------- browser sign-in (OAuth) ---------- */
+  interface Flow {
+    id: string;
+    provider: 'codex' | 'claude';
+    state: string;
+    status: 'pending' | 'complete' | 'error' | 'expired';
+    expires: number;
+    connection?: ReturnType<typeof publicConn>;
+    message?: string;
+  }
+  const flows = new Map<string, Flow>();
+  let oauthTtl = 300;
+  let oauthBusy = false;
+  const OAUTH_PORTS = { codex: 1455, claude: 54545 } as const;
+  const flowView = (f: Flow) => {
+    if (f.status === 'pending' && Date.now() > f.expires) {
+      f.status = 'expired';
+      f.message = 'Sign-in expired. Start again from the control room.';
+    }
+    return {
+      id: f.id,
+      provider: f.provider,
+      status: f.status,
+      ...(f.status === 'pending' ? { expires_in_seconds: Math.max(0, Math.ceil((f.expires - Date.now()) / 1000)) } : {}),
+      ...(f.connection ? { connection: f.connection } : {}),
+      ...(f.message ? { message: f.message } : {}),
+    };
+  };
+  /** Completing a sign-in creates (or refreshes, for the same account) a gateway-owned connection. */
+  function completeFlow(f: Flow, account: string) {
+    const kind: Kind = f.provider === 'codex' ? 'codex' : 'anthropic';
+    const secret = `oauth-${f.provider}-${account}`;
+    let c = connections.find((x) => x.kind === kind && x.secret === secret);
+    if (!c) {
+      c = {
+        id: randomUUID(),
+        name: f.provider === 'codex' ? `ChatGPT · ${account}` : `Claude · ${account}`,
+        kind,
+        base_url: f.provider === 'codex' ? 'https://chatgpt.com/backend-api/codex' : 'https://api.anthropic.com/v1',
+        enabled: true,
+        models: f.provider === 'codex' ? ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'] : ['claude-opus-5-5', 'claude-sonnet-5-5'],
+        supports_websocket: f.provider === 'codex',
+        created_at: now(),
+        secret,
+        source: 'oauth',
+      };
+      connections.push(c);
+    }
+    f.status = 'complete';
+    f.connection = publicConn(c);
+    broadcast({ type: 'overview', data: overview() });
+  }
 
   function overview() {
     const lat = requests.map((r) => r.latency_ms).sort((a, b) => a - b);
@@ -140,13 +223,18 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   function seed() {
     const t = (minsAgo: number) => new Date(Date.now() - minsAgo * 60000).toISOString();
     connections = [
-      { id: randomUUID(), name: 'Codex', kind: 'codex', base_url: 'https://chatgpt.com/backend-api/codex', enabled: true, models: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'], supports_websocket: true, created_at: t(4000), secret: 'x' },
-      { id: randomUUID(), name: 'Codex', kind: 'codex', base_url: 'https://chatgpt.com/backend-api/codex', enabled: true, models: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'], supports_websocket: true, created_at: t(3000), secret: 'x' },
-      { id: randomUUID(), name: 'Claude Code', kind: 'anthropic', base_url: 'https://api.anthropic.com/v1', enabled: true, models: ['claude-opus-5-5', 'claude-sonnet-5-5'], supports_websocket: false, created_at: t(2000), secret: 'x' },
-      { id: randomUUID(), name: 'Gemini', kind: 'gemini', base_url: 'https://generativelanguage.googleapis.com/v1beta', enabled: true, models: ['gemini-3-pro'], supports_websocket: false, created_at: t(1500), secret: 'x' },
-      { id: randomUUID(), name: 'Ollama', kind: 'openai', base_url: 'http://127.0.0.1:11434/v1', enabled: false, models: ['qwen3-coder:30b', 'llama4:scout'], supports_websocket: false, created_at: t(1000), secret: '' },
+      { id: randomUUID(), name: 'Codex', kind: 'codex', base_url: 'https://chatgpt.com/backend-api/codex', enabled: true, models: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'], supports_websocket: true, created_at: t(4000), secret: 'x', source: 'oauth' },
+      { id: randomUUID(), name: 'Codex', kind: 'codex', base_url: 'https://chatgpt.com/backend-api/codex', enabled: true, models: ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'], supports_websocket: true, created_at: t(3000), secret: 'x', source: 'native_codex' },
+      { id: randomUUID(), name: 'Claude Code', kind: 'anthropic', base_url: 'https://api.anthropic.com/v1', enabled: true, models: ['claude-opus-5-5', 'claude-sonnet-5-5'], supports_websocket: false, created_at: t(2000), secret: 'x', source: 'native_claude' },
+      { id: randomUUID(), name: 'Gemini', kind: 'gemini', base_url: 'https://generativelanguage.googleapis.com/v1beta', enabled: true, models: ['gemini-3-pro'], supports_websocket: false, created_at: t(1500), secret: 'x', source: 'api_key' },
+      { id: randomUUID(), name: 'Ollama', kind: 'openai', base_url: 'http://127.0.0.1:11434/v1', enabled: false, models: ['qwen3-coder:30b', 'llama4:scout'], supports_websocket: false, created_at: t(1000), secret: '', source: 'api_key' },
     ];
     const [codexA, codexB, claude] = connections;
+    const nowS = Math.floor(Date.now() / 1000);
+    codexB.expires = nowS + 5 * 3600; // CLI login that will need a re-login soon
+    claude.expires = nowS + 9 * 86400;
+    cooldowns.clear();
+    cooldowns.set(codexA.id, [{ model: 'gpt-6.1-sol', until: Date.now() + 95_000 }]);
     routes = [
       { model: 'coding', strategy: 'failover', targets: [{ connection_id: codexA.id, model: 'gpt-6.1-sol' }, { connection_id: claude.id, model: 'claude-opus-5-5' }] },
       { model: 'gpt-6.1-sol', strategy: 'round_robin', targets: [{ connection_id: codexA.id, model: 'gpt-6.1-sol' }, { connection_id: codexB.id, model: 'gpt-6.1-sol' }] },
@@ -163,15 +251,56 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   }
 
   function randomRequest(): Omit<Rec, 'id' | 'timestamp'> {
+    const base = baseRequest();
+    if (base.status === 401) return { ...base, attempts: [], failovers: 0 };
+    const c = connections.find((x) => x.id === base.connection_id)!;
+    const route = base.route ? routes.find((r) => r.model === base.route) : undefined;
+    const upstream = route?.targets.find((t) => t.connection_id === c.id)?.model ?? base.model;
+    const total = base.latency_ms;
+    const streamed = base.transport !== 'http';
+    const attempts: NonNullable<Rec['attempts']> = [];
+    let failovers = 0;
+    // Some routed requests fail over: another target was rate limited or down first.
+    const other = route?.targets.find((t) => t.connection_id !== c.id);
+    const otherConn = other && connections.find((x) => x.id === other.connection_id);
+    if (otherConn && base.status === 200 && Math.random() < 0.3) {
+      const failed = Math.random() < 0.7 ? { status: 429, error: 'rate_limited' } : { status: 503, error: 'provider_unavailable' };
+      attempts.push({ connection_id: otherConn.id, connection_name: otherConn.name, model: other!.model, ...failed, duration_ms: Math.round(80 + Math.random() * 400) });
+      failovers = 1;
+    }
+    const errLabel: Record<number, string> = { 429: 'rate_limited', 502: 'provider_unavailable', 504: 'transport_failed' };
+    attempts.push({
+      connection_id: c.id,
+      connection_name: c.name,
+      model: upstream,
+      status: base.status === 504 ? 0 : base.transport === 'websocket' && base.status === 200 ? 101 : base.status,
+      duration_ms: Math.round(Math.min(total, 120 + Math.random() * 500)),
+      error: base.status === 200 ? null : (errLabel[base.status] ?? 'request_rejected'),
+    });
+    const before = attempts.slice(0, -1).reduce((n, a) => n + a.duration_ms, 0);
+    const ttfb = base.status === 200 ? before + Math.round(150 + Math.random() * 700) : null;
+    return {
+      ...base,
+      latency_ms: total + before,
+      failovers,
+      attempts,
+      ttfb_ms: ttfb,
+      first_token_ms: ttfb !== null && streamed ? ttfb + Math.round(40 + Math.random() * 600) : null,
+    };
+  }
+
+  function baseRequest(): Omit<Rec, 'id' | 'timestamp'> {
     const enabled = connections.filter((c) => c.enabled);
     let c = enabled[Math.floor(Math.random() * enabled.length)] ?? connections[0];
     let model = c.models[Math.floor(Math.random() * c.models.length)];
     const route = Math.random() < 0.35 ? routes[Math.floor(Math.random() * routes.length)] : undefined;
     const target = route?.targets[Math.floor(Math.random() * route.targets.length)];
     const viaRoute = target && enabled.find((x) => x.id === target.connection_id);
+    let routeName: string | null = null;
     if (route && viaRoute) {
       c = viaRoute;
       model = route.model;
+      routeName = route.model;
     }
     const transport: Rec['transport'] = c.supports_websocket && Math.random() < 0.55 ? 'websocket' : Math.random() < 0.75 ? 'sse' : 'http';
     const roll = Math.random();
@@ -192,11 +321,17 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
       input_tokens: status === 200 ? Math.round(400 + Math.random() * 24000) : null,
       output_tokens: status === 200 ? Math.round(20 + Math.random() * 2400) : null,
       error: status === 200 ? null : errors[status],
+      route: routeName,
     };
   }
 
   function reset() {
     generation++;
+    flows.clear();
+    cooldowns.clear();
+    catalogReject = false;
+    oauthTtl = 300;
+    oauthBusy = false;
     connections = [];
     routes = [];
     keys = [];
@@ -228,10 +363,21 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
         }
       });
     });
-  const hasCookie = (req: IncomingMessage) => (req.headers.cookie ?? '').split(';').some((c) => c.trim() === `sy_session=${session}`);
+  const cookieToken = (req: IncomingMessage) =>
+    (req.headers.cookie ?? '')
+      .split(';')
+      .map((c) => c.trim())
+      .find((c) => c.startsWith('sy_session='))
+      ?.slice('sy_session='.length) ?? null;
+  const hasCookie = (req: IncomingMessage) => {
+    const t = cookieToken(req);
+    return !!t && sessions.has(t);
+  };
   const bearer = (req: IncomingMessage) => {
     const h = req.headers.authorization;
-    return h?.startsWith('Bearer ') ? h.slice(7) : ((req.headers['x-api-key'] as string | undefined) ?? null);
+    return h?.startsWith('Bearer ')
+      ? h.slice(7)
+      : ((req.headers['x-api-key'] as string | undefined) ?? (req.headers['x-goog-api-key'] as string | undefined) ?? null);
   };
   const isAdmin = (req: IncomingMessage) => hasCookie(req) || bearer(req) === ADMIN_TOKEN;
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -308,8 +454,31 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
 
     if (path === '/healthz') return json(res, 200, { status: 'ok' });
 
+    // Stand-in for the provider's consent page. `remote=1` mimics a browser on another
+    // machine: the loopback redirect can't reach the gateway, so nothing completes.
+    if (path === '/__mock/oauth/authorize') {
+      const f = flows.get(url.searchParams.get('id') ?? '');
+      const remote = url.searchParams.get('remote') === '1';
+      if (f && f.status === 'pending' && !remote && url.searchParams.get('state') === f.state) completeFlow(f, url.searchParams.get('account') ?? 'you@example.com');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(
+        f && !remote
+          ? '<!doctype html><title>Signed in</title><p>Signed in. You can close this tab and return to Switchyard.</p>'
+          : `<!doctype html><title>localhost</title><p>This site can’t be reached (mock). Copy this address: http://localhost:${f ? OAUTH_PORTS[f.provider] : 1455}/auth/callback?code=mockcode&amp;state=${f?.state ?? ''}</p>`,
+      );
+      return;
+    }
+
+    if (path === '/api/session' && method === 'DELETE') {
+      const t = cookieToken(req);
+      if (t) sessions.delete(t);
+      res.setHeader('set-cookie', 'sy_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0');
+      return json(res, 200, { authenticated: false });
+    }
     if (path === '/api/session') {
       const tokenOk = bearer(req) === ADMIN_TOKEN;
+      const session = randomUUID();
+      sessions.add(session);
       if (!tokenOk && authMode === 'token') return fail(res, 401, 'Open the local dashboard or provide the admin token');
       res.setHeader('set-cookie', `sy_session=${session}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=43200`);
       return json(res, 200, { authenticated: true });
@@ -320,6 +489,27 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
       switch (action) {
         case 'seed':
           seed();
+          break;
+        case 'catalog-reject':
+          catalogReject = true;
+          break;
+        case 'catalog-accept':
+          catalogReject = false;
+          break;
+        case 'cooldown': {
+          // Bench the first enabled Codex account for two minutes.
+          const c = connections.find((x) => x.enabled && x.kind === 'codex');
+          if (c) cooldowns.set(c.id, [{ model: '*', until: Date.now() + 120_000 }]);
+          break;
+        }
+        case 'oauth-busy':
+          oauthBusy = true;
+          break;
+        case 'oauth-free':
+          oauthBusy = false;
+          break;
+        case 'oauth-ttl':
+          oauthTtl = Number(url.searchParams.get('seconds') ?? 300);
           break;
         case 'reset':
           reset();
@@ -351,7 +541,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
           eventsEnabled = true;
           break;
         case 'expire-session':
-          session = randomUUID();
+          sessions.clear();
           for (const ws of eventSockets) ws.terminate();
           break;
         default:
@@ -381,7 +571,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
       if (path === '/api/connections' && method === 'POST') {
         const err = validate(body);
         if (err) return fail(res, 400, err);
-        const c: Conn = { id: randomUUID(), name: body.name, kind: body.kind, base_url: body.base_url.replace(/\/+$/, ''), enabled: body.enabled ?? true, models: body.models, supports_websocket: !!body.supports_websocket, created_at: now(), secret: body.api_key ?? '' };
+        const c: Conn = { id: randomUUID(), name: body.name, kind: body.kind, base_url: body.base_url.replace(/\/+$/, ''), enabled: body.enabled ?? true, models: body.models, supports_websocket: !!body.supports_websocket, created_at: now(), secret: body.api_key ?? '', source: 'api_key' };
         connections.push(c);
         broadcast({ type: 'overview', data: overview() });
         return json(res, 200, publicConn(c));
@@ -393,7 +583,10 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
           const err = validate(body);
           if (err) return fail(res, 400, err);
           Object.assign(c, { name: body.name, kind: body.kind, base_url: body.base_url.replace(/\/+$/, ''), enabled: body.enabled ?? true, models: body.models, supports_websocket: !!body.supports_websocket });
-          if (body.api_key) c.secret = body.api_key;
+          if (body.api_key) {
+            c.secret = body.api_key;
+            c.source = 'api_key';
+          }
           broadcast({ type: 'overview', data: overview() });
           return json(res, 200, publicConn(c));
         }
@@ -404,6 +597,53 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
           res.writeHead(204).end();
           return;
         }
+      }
+      if (seg[1] === 'connections' && seg[3] === 'models' && method === 'GET') {
+        const c = connections.find((x) => x.id === decodeURIComponent(seg[2]));
+        if (!c) return fail(res, 404, 'Connection not found');
+        await sleep(350 + Math.random() * 400);
+        const local = c.base_url.includes('127.0.0.1');
+        if (catalogReject || (!c.secret && !local)) return fail(res, 424, 'Provider model catalog unavailable. Check the account or enter model identifiers manually.');
+        const catalogs: Record<string, [string, string][]> = {
+          codex: [
+            ['gpt-6.1-sol', 'GPT-6.1 Sol'],
+            ['gpt-6-astra', 'GPT-6 Astra'],
+            ['gpt-6-luna', 'GPT-6 Luna'],
+            ['gpt-6.1-sol-mini', 'GPT-6.1 Sol mini'],
+            ['gpt-6-astra-codex', 'GPT-6 Astra (Codex)'],
+            ['gpt-6-nova', 'GPT-6 Nova'],
+            ['gpt-5.5', 'GPT-5.5'],
+            ['gpt-5.5-codex', 'GPT-5.5 Codex'],
+            ['gpt-5.5-mini', 'GPT-5.5 mini'],
+            ['codex-mini-latest', 'Codex mini'],
+          ],
+          anthropic: [
+            ['claude-opus-5-5', 'Claude Opus 5.5'],
+            ['claude-sonnet-5-5', 'Claude Sonnet 5.5'],
+            ['claude-fable-5-1', 'Claude Fable 5.1'],
+            ['claude-haiku-4-5', 'Claude Haiku 4.5'],
+            ['claude-opus-5-1', 'Claude Opus 5.1'],
+            ['claude-sonnet-5', 'Claude Sonnet 5'],
+            ['claude-opus-4-5', 'Claude Opus 4.5'],
+            ['claude-sonnet-4-5', 'Claude Sonnet 4.5'],
+          ],
+          gemini: [
+            ['gemini-3-pro', 'Gemini 3 Pro'],
+            ['gemini-3-flash', 'Gemini 3 Flash'],
+            ['gemini-3-flash-lite', 'Gemini 3 Flash-Lite'],
+          ],
+          openai: [
+            ['qwen3-coder:30b', 'qwen3-coder:30b'],
+            ['llama4:scout', 'llama4:scout'],
+            ['gpt-oss:20b', 'gpt-oss:20b'],
+          ],
+        };
+        const list = catalogs[c.kind] ?? [];
+        return json(res, 200, {
+          connection_id: c.id,
+          models: list.map(([id, name]) => ({ id, name })),
+          ...(c.kind === 'gemini' ? { truncated: true, message: "The provider's catalog could only be read in part. Add any missing models manually." } : {}),
+        });
       }
       if (seg[1] === 'connections' && seg[3] === 'test' && method === 'POST') {
         const c = connections.find((x) => x.id === decodeURIComponent(seg[2]));
@@ -420,7 +660,8 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
         const make = (name: string, kind: Kind, base: string, models: string[], ws: boolean, account: string) => {
           const existing = connections.find((c) => c.kind === kind && c.secret === account);
           if (existing) return existing;
-          const c: Conn = { id: randomUUID(), name, kind, base_url: base, enabled: true, models, supports_websocket: ws, created_at: now(), secret: account };
+          const src: Conn['source'] = source === 'cliproxy' ? 'cliproxy' : kind === 'codex' ? 'native_codex' : 'native_claude';
+          const c: Conn = { id: randomUUID(), name, kind, base_url: base, enabled: true, models, supports_websocket: ws, created_at: now(), secret: account, source: src };
           connections.push(c);
           return c;
         };
@@ -463,6 +704,10 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
           return;
         }
       }
+      if (seg[1] === 'requests' && seg.length === 3 && method === 'GET') {
+        const r = requests.find((x) => x.id === decodeURIComponent(seg[2]));
+        return r ? json(res, 200, r) : fail(res, 404, 'Request no longer retained in activity history');
+      }
       if (path === '/api/requests' && method === 'GET') {
         const status = url.searchParams.get('status');
         const model = url.searchParams.get('model');
@@ -485,6 +730,63 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
         keys = keys.filter((k) => k.id !== decodeURIComponent(seg[2]));
         res.writeHead(204).end();
         return;
+      }
+      if (path === '/api/oauth/start' && method === 'POST') {
+        const provider = body?.provider;
+        if (provider !== 'codex' && provider !== 'claude') return fail(res, 400, 'Choose codex or claude');
+        if (oauthBusy)
+          return fail(res, 409, `Sign-in callback port ${OAUTH_PORTS[provider as 'codex' | 'claude']} is already in use. Close any running codex login, claude login or CLIProxyAPI login, then retry.`);
+        for (const f of flows.values()) {
+          if (f.provider === provider && f.status === 'pending') {
+            f.status = 'error';
+            f.message = 'Replaced by a newer sign-in.';
+          }
+        }
+        const f: Flow = { id: randomUUID().replace(/-/g, ''), provider, state: randomUUID().replace(/-/g, ''), status: 'pending', expires: Date.now() + oauthTtl * 1000 };
+        flows.set(f.id, f);
+        const host = req.headers.host ?? '127.0.0.1:5181';
+        return json(res, 200, {
+          id: f.id,
+          provider,
+          authorization_url: `http://${host}/__mock/oauth/authorize?id=${f.id}&state=${f.state}&provider=${provider}`,
+          expires_in_seconds: oauthTtl,
+          status: 'pending',
+        });
+      }
+      if (seg[1] === 'oauth' && seg.length >= 3) {
+        const f = flows.get(decodeURIComponent(seg[2]));
+        if (!f) return fail(res, 404, 'Sign-in not found. It may have expired; start again.');
+        if (seg.length === 3 && method === 'GET') return json(res, 200, flowView(f));
+        if (seg.length === 3 && method === 'DELETE') {
+          if (flowView(f).status === 'pending') {
+            f.status = 'error';
+            f.message = 'Sign-in cancelled.';
+          }
+          return json(res, 200, flowView(f));
+        }
+        if (seg[3] === 'callback' && method === 'POST') {
+          const input = String(body?.input ?? '').trim();
+          if (flowView(f).status !== 'pending') return json(res, 200, flowView(f));
+          let code: string | null = null;
+          let state: string | null = null;
+          try {
+            const u = new URL(input);
+            if (u.searchParams.get('error')) {
+              f.status = 'error';
+              f.message = `The provider reported: ${u.searchParams.get('error')}`;
+              return json(res, 200, flowView(f));
+            }
+            code = u.searchParams.get('code');
+            state = u.searchParams.get('state');
+          } catch {
+            const parts = input.split('#');
+            if (parts.length === 2) [code, state] = parts;
+          }
+          if (!code || !state) return fail(res, 400, 'Paste the full callback URL from the browser address bar');
+          if (state !== f.state) return fail(res, 400, 'That callback belongs to a different sign-in. Copy the address from this sign-in’s page.');
+          completeFlow(f, code === 'mockcode' ? 'you@example.com' : code);
+          return json(res, 200, flowView(f));
+        }
       }
       if (path === '/api/playground' && method === 'POST') {
         if (!body?.model) return fail(res, 400, 'Choose a model');

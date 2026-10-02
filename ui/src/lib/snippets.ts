@@ -63,7 +63,7 @@ export function shellQuote(s: string): string {
 /** JSON/JS/Python/TOML double-quoted string literal. */
 const q = (s: string) => JSON.stringify(s);
 
-export type ClientId = 'codex' | 'claude-code' | 'opencode' | 'cursor' | 'curl' | 'openai-sdk' | 'anthropic-sdk' | 'websocket';
+export type ClientId = 'codex' | 'claude-code' | 'opencode' | 'cursor' | 'curl' | 'openai-sdk' | 'anthropic-sdk' | 'gemini' | 'websocket';
 
 export interface SnippetBlock {
   title: string;
@@ -78,7 +78,7 @@ export interface ClientGuide {
   label: string;
   blurb: string;
   /** Which upstream API family the client speaks, to warn on mismatched models. */
-  speaks: 'openai' | 'anthropic' | 'any';
+  speaks: 'openai' | 'anthropic' | 'gemini' | 'any';
   blocks: SnippetBlock[];
   notes: string[];
 }
@@ -94,7 +94,7 @@ export interface SnippetInput {
 
 const exportKey = `export ${KEY_ENV}=sy_...   # the client key you created in Switchyard`;
 
-export const CLIENT_ORDER: ClientId[] = ['codex', 'claude-code', 'opencode', 'cursor', 'curl', 'openai-sdk', 'anthropic-sdk', 'websocket'];
+export const CLIENT_ORDER: ClientId[] = ['codex', 'claude-code', 'opencode', 'cursor', 'curl', 'openai-sdk', 'anthropic-sdk', 'gemini', 'websocket'];
 
 export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
   const { urls, model } = input;
@@ -220,7 +220,7 @@ export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
       ].join('\n');
       const gemini = [
         `curl ${shellQuote(`${urls.gemini}/models/${encodeURIComponent(model)}:generateContent`)} \\`,
-        `  -H "x-api-key: $${KEY_ENV}" \\`,
+        `  -H "x-goog-api-key: $${KEY_ENV}" \\`,
         '  -H "Content-Type: application/json" \\',
         `  -d ${shellQuote(JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Hello' }] }] }))}`,
       ].join('\n');
@@ -235,7 +235,7 @@ export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
           { title: 'Anthropic Messages', language: 'bash', code: messages },
           { title: 'Gemini generateContent', language: 'bash', code: gemini },
         ],
-        notes: ['Client keys work as `Authorization: Bearer` or `x-api-key`.'],
+        notes: ['Client keys work as `Authorization: Bearer`, `x-api-key` or (for Gemini clients) `x-goog-api-key`.'],
       };
     }
     case 'openai-sdk': {
@@ -320,6 +320,60 @@ export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
         notes: [],
       };
     }
+    case 'gemini': {
+      const py = [
+        'import os',
+        'from google import genai',
+        'from google.genai import types',
+        '',
+        'client = genai.Client(',
+        `    api_key=os.environ[${q(KEY_ENV)}],`,
+        `    http_options=types.HttpOptions(base_url=${q(urls.origin)}),`,
+        ')',
+        '',
+        'for chunk in client.models.generate_content_stream(',
+        `    model=${q(model)},`,
+        '    contents="Explain backpressure in one paragraph.",',
+        '):',
+        '    print(chunk.text or "", end="", flush=True)',
+      ].join('\n');
+      const ts = [
+        "import { GoogleGenAI } from '@google/genai';",
+        '',
+        'const ai = new GoogleGenAI({',
+        `  apiKey: process.env.${KEY_ENV},`,
+        `  httpOptions: { baseUrl: ${q(urls.origin)} },`,
+        '});',
+        '',
+        'const stream = await ai.models.generateContentStream({',
+        `  model: ${q(model)},`,
+        "  contents: 'Explain backpressure in one paragraph.',",
+        '});',
+        "for await (const chunk of stream) process.stdout.write(chunk.text ?? '');",
+      ].join('\n');
+      const stream = [
+        `curl -N ${shellQuote(`${urls.gemini}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`)} \\`,
+        `  -H "x-goog-api-key: $${KEY_ENV}" \\`,
+        '  -H "Content-Type: application/json" \\',
+        `  -d ${shellQuote(JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'Write a haiku about rail yards' }] }] }))}`,
+      ].join('\n');
+      return {
+        id,
+        label: 'Gemini',
+        blurb: 'Google’s Gen AI SDKs send your key as x-goog-api-key, which Switchyard accepts as a client key. Point their base URL at the gateway.',
+        speaks: 'gemini',
+        blocks: [
+          { title: 'Export your client key', language: 'bash', code: exportKey },
+          { title: 'Python (google-genai)', language: 'python', code: py },
+          { title: 'TypeScript (@google/genai)', language: 'typescript', code: ts },
+          { title: 'curl, streamed over SSE', language: 'bash', code: stream },
+        ],
+        notes: [
+          'The SDKs add /v1beta/models/… to the base URL themselves, so use the gateway origin without a path.',
+          'Protocol-tested: Switchyard’s tests cover x-goog-api-key auth and the generateContent and streamGenerateContent formats. It hasn’t been verified against a live Gemini account yet.',
+        ],
+      };
+    }
     case 'websocket': {
       const node = [
         "import WebSocket from 'ws';",
@@ -366,5 +420,6 @@ export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
 export function kindMismatch(speaks: ClientGuide['speaks'], kind: ConnectionKind | null | undefined): boolean {
   if (!kind || speaks === 'any') return false;
   if (speaks === 'anthropic') return kind !== 'anthropic';
+  if (speaks === 'gemini') return kind !== 'gemini';
   return kind === 'anthropic' || kind === 'gemini';
 }

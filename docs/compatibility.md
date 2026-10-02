@@ -55,8 +55,8 @@ Chat Completions on `openai` connections is passed through: streams byte for byt
 ## Responses and errors
 
 - Streams are forwarded as they arrive. See [architecture](architecture.md#stream-integrity) for how incomplete streams are detected and reported.
-- Codex streams are parsed as SSE even when the backend omits `Content-Type`.
-- Non-streaming responses are limited to 16 MiB; SSE events to 16 MiB.
+- Codex streams are parsed as SSE even when the backend omits `Content-Type`. Empty terminal `response.output` is populated from completed output items, preserving tool calls and SDK final-response helpers in SSE and WebSockets. Other events are unchanged.
+- Non-streaming responses, SSE events and Codex completed-output accumulation are limited to 16 MiB. An oversized Codex terminal response fails explicitly with partial output instead of a misleading empty success.
 - Provider errors keep their status and the fields `type`, `code`, `param`, `status`, `resets_at`, `resets_in_seconds` and `plan_type` (for example `context_length_exceeded`, `usage_limit_reached`, `rate_limit_error`). The message is prefixed with `Provider rejected the request:` and any credential it echoes is replaced with `[redacted]`. `/v1/messages`, `/v1/messages/count_tokens` errors use Anthropic's `{"type":"error","error":{...}}` envelope. `Retry-After` is passed through, or derived from the provider's reset hint for 429s.
 - Gateway errors use `{"error":{"type":"gateway_error","message":...,"retry_after_seconds":...}}`.
 
@@ -76,16 +76,16 @@ Imported and signed-in accounts start with a suggested model list (for Codex, ba
 
 | Connection kind | Catalog request | Identifier | Display name |
 | --- | --- | --- | --- |
-| `openai` | `GET {base}/models` | `data[].id` | `id` |
-| `anthropic` | `GET {base}/models` | `data[].id` | `display_name` |
+| `openai` | `GET {base}/models` | `data[].id` | `display_name` if present, else `id` |
+| `anthropic` | `GET {base}/models?limit=1000`, then `&after_id=` | `data[].id` | `display_name` |
 | `codex` | `GET {base}/models?client_version=...` | `models[].slug` | `display_name` |
-| `gemini` | `GET {base}/models` | `models[].name` without `models/` | `displayName` |
+| `gemini` | `GET {base}/models?pageSize=1000`, then `&pageToken=` | `models[].name` without `models/` | `displayName` |
 
-Only the first page of a catalog is read. Anthropic and Gemini page their catalogs, so long catalogs can be incomplete; add missing identifiers by hand. Connection tests check that the provider's model endpoint answers; the playground verifies real inference.
+Anthropic (`limit=1000` with `after_id`) and Gemini (`pageSize=1000` with `pageToken`) catalogs are paged through, up to 5 pages, 2 MiB and 1,000 models within 20 seconds. When a catalog is cut short by those bounds, a repeated cursor or a failed later page, the result says `truncated` with a message, and you can add missing identifiers by hand. See [architecture](architecture.md#management-api-for-the-dashboard) for the details. Connection tests check that the provider's model endpoint answers; the playground verifies real inference.
 
 ## Not implemented
 
 - Gemini CLI OAuth, Vertex AI, Antigravity, Grok, Qwen and other CLIProxyAPI providers.
 - Translation between providers (for example Anthropic Messages to OpenAI), except Chat Completions on Codex.
-- Automatic model discovery: catalogs are listed on request and never applied automatically, and only their first page is read.
+- Automatic model discovery: catalogs are listed on request and never applied automatically. Catalogs larger than the bounds above are returned in part.
 - Full CLIProxyAPI parity in general.

@@ -1,7 +1,7 @@
-import { Activity, CircleAlert, CircleCheck, Download, Pencil, Plug, Plus, RefreshCw, Trash2, TriangleAlert, Zap } from 'lucide-react';
+import { Activity, CircleAlert, CircleCheck, Clock, Download, KeyRound, ListChecks, LogIn, Timer, Pencil, Plug, Plus, RefreshCw, ShieldCheck, Trash2, TriangleAlert, Zap } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { qk, useConnections, useDeleteConnection, useRoutes, useTestConnection, useToggleConnection } from '../app/queries';
+import { qk, useConnections, useDeleteConnection, useImport, useRoutes, useTestConnection, useToggleConnection } from '../app/queries';
 import { navigate, useLocation, Link } from '../app/router';
 import { Dialog } from '../components/Dialog';
 import { useConfirm, useToast } from '../components/feedback';
@@ -11,22 +11,43 @@ import { ApiError, errorMessage } from '../lib/api';
 import { api } from '../lib/client';
 import { displayNames, hostOf, missingKeyWarning, presetFor, routesUsing, strandedRoutes, type ProviderPresetId } from '../lib/connections';
 import { formatMs, formatRelative } from '../lib/format';
-import type { Connection, ConnectionTestResult, Route } from '../lib/types';
+import type { Connection, ConnectionTestResult, ImportSource, OAuthProvider, Route } from '../lib/types';
 import { ConnectionFormDialog } from './connections/ConnectionForm';
-import { ImportPanel } from './connections/ImportPanel';
+import { ConnectOptions } from './connections/ImportPanel';
+import { ModelPickerDialog } from './connections/ModelPicker';
+import { ATTEMPT_LABELS, activeCooldowns, expiryInfo, formatSeconds, healthInfo } from '../lib/health';
+import { SignInDialog } from './connections/SignIn';
+import { credentialSourceInfo, oauthProviderFor } from '../lib/oauth';
 
 type TestState = { status: 'running' } | { status: 'done'; result: ConnectionTestResult; at: number } | { status: 'failed'; message: string };
 
 export function ConnectionsPage() {
   const { search } = useLocation();
   const params = new URLSearchParams(search);
-  const connections = useConnections();
+  const connections = useConnections({ health: true });
+  const fetchedAt = connections.dataUpdatedAt;
+  const modelsParam = params.get('models');
+  const [pickingId, setPickingId] = useState<string | null>(null);
+  const pickId = pickingId ?? modelsParam;
+  const picking = pickId ? (connections.data?.find((c) => c.id === pickId) ?? null) : null;
+  const closePicker = () => {
+    setPickingId(null);
+    if (modelsParam) navigate('/connections', { replace: true });
+  };
   const routes = useRoutes();
   const [editing, setEditing] = useState<Connection | null>(null);
   const formOpen = params.get('new') === '1' || !!editing;
   const importOpen = params.get('import') === '1';
   const presetParam = params.get('preset') as ProviderPresetId | null;
   const [tests, setTests] = useState<Record<string, TestState>>({});
+  const signinParam = params.get('signin');
+  const [signInState, setSignIn] = useState<OAuthProvider | null>(null);
+  // ?signin=codex|claude deep-links straight into a browser sign-in.
+  const signIn = signInState ?? (signinParam === 'codex' || signinParam === 'claude' ? signinParam : null);
+  const closeSignIn = () => {
+    setSignIn(null);
+    if (signinParam) navigate('/connections', { replace: true });
+  };
 
   const closeForm = () => {
     setEditing(null);
@@ -62,11 +83,11 @@ export function ConnectionsPage() {
               <Button icon={RefreshCw} onClick={testAll} disabled={!anyEnabled}>
                 Test all
               </Button>
-              <Button icon={Download} onClick={() => navigate('/connections?import=1')}>
-                Import login
+              <Button icon={KeyRound} onClick={() => navigate('/connections?new=1')}>
+                Add API key
               </Button>
-              <Button variant="primary" icon={Plus} onClick={() => navigate('/connections?new=1')}>
-                Add connection
+              <Button variant="primary" icon={Plus} onClick={() => navigate('/connections?import=1')}>
+                Connect account
               </Button>
             </>
           ) : null
@@ -85,7 +106,7 @@ export function ConnectionsPage() {
             </div>
           ))}
         </div>
-      ) : connections.isError ? (
+      ) : connections.isError && !connections.data ? (
         <Callout tone="err" title="Couldn’t load connections" role="alert" action={<Button size="sm" icon={RefreshCw} onClick={() => connections.refetch()}>Retry</Button>}>
           {errorMessage(connections.error)}
         </Callout>
@@ -109,6 +130,9 @@ export function ConnectionsPage() {
                 test={tests[c.id]}
                 onTest={() => runTest(c)}
                 onEdit={() => setEditing(c)}
+                onSignIn={setSignIn}
+                onChooseModels={() => setPickingId(c.id)}
+                fetchedAt={fetchedAt}
               />
             ))}
           </ul>
@@ -118,15 +142,17 @@ export function ConnectionsPage() {
         </>
       )}
 
+      <SignInDialog provider={signIn} onClose={closeSignIn} />
+      <ModelPickerDialog connection={picking} mode="save" onClose={closePicker} />
       <ConnectionFormDialog open={formOpen} onClose={closeForm} connection={editing} initialPreset={presetParam ?? undefined} />
       <Dialog
         open={importOpen}
         onClose={() => navigate('/connections', { replace: true })}
-        title="Import a signed-in account"
-        description="Use the subscriptions you already pay for. Runs on the gateway machine."
-        width={560}
+        title="Connect an account"
+        description="Sign in, reuse a CLI login, or add an API key. Add as many accounts as you like."
+        width={640}
       >
-        <ImportPanel />
+        <ConnectOptions />
       </Dialog>
     </>
   );
@@ -138,22 +164,9 @@ function FirstConnection() {
       <div className="first-conn">
         <div className="stack-sm">
           <h2>Bring your accounts</h2>
-          <p className="muted">Import a CLI login in one click, or add an API key. You can add as many accounts as you like and route between them.</p>
+          <p className="muted">Sign in with ChatGPT or Claude, reuse a CLI login, or add an API key. Add as many accounts as you like and route between them.</p>
         </div>
-        <ImportPanel />
-        <hr className="divider" />
-        <div className="stack-sm">
-          <h3>Or add an API provider</h3>
-          <div className="provider-buttons">
-            {(['openai', 'anthropic', 'gemini', 'compatible'] as const).map((id) => (
-              <button key={id} type="button" className="provider-button" onClick={() => navigate(`/connections?new=1&preset=${id}`)}>
-                <KindMark kind={id === 'compatible' ? 'openai' : id} size="sm" />
-                {id === 'compatible' ? 'OpenAI-compatible' : kindLabel(id)}
-                <Plus aria-hidden className="muted" />
-              </button>
-            ))}
-          </div>
-        </div>
+        <ConnectOptions />
       </div>
     </div>
   );
@@ -167,6 +180,9 @@ function ConnectionRow({
   test,
   onTest,
   onEdit,
+  onSignIn,
+  onChooseModels,
+  fetchedAt,
 }: {
   connection: Connection;
   displayName: string;
@@ -175,7 +191,30 @@ function ConnectionRow({
   test?: TestState;
   onTest: () => void;
   onEdit: () => void;
+  onSignIn: (p: OAuthProvider) => void;
+  onChooseModels: () => void;
+  fetchedAt: number;
 }) {
+  const rawSource = credentialSourceInfo(c.credential_source);
+  // An "api_key" connection without a stored key (typical for local servers) shouldn't claim one.
+  const source =
+    rawSource && rawSource.owner === 'key' && !c.credential_present
+      ? { ...rawSource, label: missingKeyWarning(c) ? 'No API key stored' : 'No key needed', detail: 'No credential is stored for this connection.' }
+      : rawSource;
+  const oauthProvider = oauthProviderFor(c.kind);
+  const reimport = useImport();
+  const reimportFrom: ImportSource | null = c.credential_source === 'native_codex' ? 'codex' : c.credential_source === 'native_claude' ? 'claude' : null;
+  const runReimport = () => {
+    if (!reimportFrom) return;
+    reimport.mutate(
+      { source: reimportFrom },
+      {
+        onSuccess: () => toast({ tone: 'ok', title: `Re-imported ${displayName}`, message: 'Picked up the latest CLI login. Original files were not modified.' }),
+        onError: (e) => toast({ tone: 'err', title: 'Re-import failed', message: errorMessage(e) }),
+      },
+    );
+  };
+  const authFailed = test?.status === 'done' && !test.result.ok && (test.result.status === 401 || test.result.status === 403);
   const toggle = useToggleConnection();
   const toast = useToast();
   const confirm = useConfirm();
@@ -256,7 +295,7 @@ function ConnectionRow({
             {displayName}
           </h3>
           <span className="muted small">{presetFor(c) === 'compatible' && c.kind === 'openai' ? 'OpenAI-compatible' : kindLabel(c.kind)}</span>
-          {!c.enabled ? <Badge>Disabled</Badge> : null}
+          <HealthChip connection={c} />
           {c.supports_websocket ? (
             <Badge tone="info" icon={Zap} title="Supports Responses WebSocket mode">
               WS
@@ -272,6 +311,19 @@ function ConnectionRow({
         <div className="conn-sub mono truncate" title={c.base_url}>
           {hostOf(c.base_url)}
         </div>
+        {source ? (
+          <div className={`conn-source owner-${source.owner}`} title={source.detail}>
+            {source.owner === 'gateway' ? <ShieldCheck aria-hidden /> : source.owner === 'source' ? <Download aria-hidden /> : <KeyRound aria-hidden />}
+            <span>
+              {source.label}
+              <span className="muted">
+                {' · '}
+                {source.owner === 'gateway' ? 'refreshed by Switchyard' : source.owner === 'source' ? (c.credential_source === 'cliproxy' ? 'follows its CLIProxyAPI file' : 'follows the CLI login') : c.credential_present ? 'stored key' : 'local server'}
+              </span>
+            </span>
+            <span className="sr-only">. {source.detail}</span>
+          </div>
+        ) : null}
         <div className="chips conn-models" aria-label={`${c.models.length} models`}>
           {shown.map((m) => (
             <span className="model-chip" key={m} title={m}>
@@ -285,7 +337,38 @@ function ConnectionRow({
           ) : null}
           {!c.models.length ? <span className="muted small">No models listed</span> : null}
         </div>
+        <HealthDetails connection={c} fetchedAt={fetchedAt} />
         <TestResult test={test} />
+        {authFailed ? (
+          <div className="conn-recover">
+            <span className="small">
+              {c.credential_source === 'oauth'
+                ? 'The provider rejected this sign-in. Signing in again usually fixes it.'
+                : reimportFrom
+                  ? `This login follows ${reimportFrom === 'codex' ? 'the Codex CLI' : 'Claude Code'}. Sign in there again on the gateway machine, then re-import. Or switch to a browser sign-in that Switchyard keeps fresh.`
+                  : c.credential_source === 'api_key'
+                    ? 'The provider rejected this key. Paste a new one from Edit.'
+                    : 'The provider rejected this credential.'}
+            </span>
+            <div className="row row-wrap">
+              {reimportFrom ? (
+                <Button size="sm" icon={Download} onClick={runReimport} loading={reimport.isPending}>
+                  Re-import
+                </Button>
+              ) : null}
+              {oauthProvider && c.credential_source !== 'api_key' ? (
+                <Button size="sm" variant={c.credential_source === 'oauth' ? 'primary' : 'default'} icon={LogIn} onClick={() => onSignIn(oauthProvider)}>
+                  Sign in again
+                </Button>
+              ) : null}
+              {c.credential_source === 'api_key' ? (
+                <Button size="sm" icon={Pencil} onClick={onEdit}>
+                  Replace key
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
       </div>
       <div className="conn-actions">
         <Button size="sm" icon={Plug} onClick={onTest} loading={test?.status === 'running'}>
@@ -296,6 +379,11 @@ function ConnectionRow({
           label={`More actions for ${displayName}`}
           items={[
             { label: 'Edit', icon: Pencil, onSelect: onEdit },
+            { label: 'Choose models…', icon: ListChecks, onSelect: onChooseModels },
+            ...(c.credential_source === 'oauth' && oauthProvider ? [{ label: 'Sign in again', icon: LogIn, onSelect: () => onSignIn(oauthProvider) }] : []),
+            ...(reimportFrom ? [{ label: `Re-import from ${reimportFrom === 'codex' ? 'Codex CLI' : 'Claude Code'}`, icon: Download, onSelect: runReimport }] : []),
+            ...(c.credential_source === 'cliproxy' ? [{ label: 'Re-import from CLIProxyAPI…', icon: Download, onSelect: () => navigate('/connections?import=1') }] : []),
+            ...(reimportFrom && oauthProvider ? [{ label: 'Use a browser sign-in instead', icon: LogIn, onSelect: () => onSignIn(oauthProvider) }] : []),
             { label: 'Try in playground', icon: Zap, onSelect: () => navigate(`/playground?model=${encodeURIComponent(c.models[0] ?? '')}`), disabled: !c.models.length || !c.enabled },
             { label: 'View activity', icon: Activity, onSelect: () => navigate(`/activity?connection=${encodeURIComponent(c.id)}`) },
             'separator',
@@ -304,6 +392,73 @@ function ConnectionRow({
         />
       </div>
     </li>
+  );
+}
+
+export function HealthChip({ connection: c }: { connection: Connection }) {
+  const info = healthInfo(c.health, c.enabled);
+  if (!info) return null;
+  return (
+    <span className={`health-chip tone-${info.tone}`} title={info.help}>
+      <span className="dot" aria-hidden />
+      {info.label}
+      <span className="sr-only">. {info.help}</span>
+    </span>
+  );
+}
+
+/** Cooldowns (live countdown), last use and credential expiry. Quiet when there's nothing to say. */
+function HealthDetails({ connection: c, fetchedAt }: { connection: Connection; fetchedAt: number }) {
+  const qc = useQueryClient();
+  const h = c.health;
+  const hasCooldowns = !!h?.cooldowns.length;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasCooldowns) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [hasCooldowns]);
+  const cooldowns = activeCooldowns(h, fetchedAt || now, now);
+  // When the last cooldown runs out, ask the gateway for the fresh state.
+  const ended = hasCooldowns && cooldowns.length === 0;
+  useEffect(() => {
+    if (ended) void qc.invalidateQueries({ queryKey: qk.connections });
+  }, [ended, qc]);
+  const expiry = expiryInfo(c, now);
+  const lastOk = h?.last_status != null && h.last_status < 400 && !h.last_error;
+  return (
+    <>
+      {cooldowns.length ? (
+        <ul className="cooldowns" aria-label="Cooldowns">
+          {cooldowns.map((cd) => (
+            <li key={cd.model} className={cd.model === '*' ? 'account' : ''}>
+              <Timer aria-hidden />
+              <span className={cd.model === '*' ? '' : 'mono'}>{cd.label}</span>
+              <span className="muted">back in</span>
+              <span className="num">{formatSeconds(cd.remaining)}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {h?.last_used_at ? (
+        <div className="conn-lastused small">
+          <span className={`dot ${lastOk ? 'dot-ok' : 'dot-err'}`} aria-hidden />
+          <span>
+            Last used {formatRelative(h.last_used_at)}
+            {h.last_status != null ? <span className="muted"> · {h.last_status === 0 ? 'no response' : `HTTP ${h.last_status}`}</span> : null}
+            {h.last_error ? <span className="muted"> · {ATTEMPT_LABELS[h.last_error] ?? h.last_error}</span> : null}
+          </span>
+        </div>
+      ) : h ? (
+        <div className="conn-lastused small muted">Not used yet</div>
+      ) : null}
+      {expiry ? (
+        <div className={`conn-expiry tone-${expiry.tone}`}>
+          <Clock aria-hidden />
+          {expiry.text}
+        </div>
+      ) : null}
+    </>
   );
 }
 

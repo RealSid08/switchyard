@@ -8,19 +8,22 @@ import {
   Pause,
   Play,
   Plug,
+  RefreshCw,
   Search,
   Settings,
   SquareTerminal,
   Sun,
   TriangleAlert,
   Waypoints,
+  WifiOff,
   type LucideIcon,
 } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { BrandMark } from '../components/BrandMark';
 import { useConfirm, useToast } from '../components/feedback';
 import { Button } from '../components/ui';
-import { errorMessage } from '../lib/api';
+import { ApiError, errorMessage } from '../lib/api';
+import { useQueryClient } from '@tanstack/react-query';
 import { formatNumber } from '../lib/format';
 import { CommandPalette } from './CommandPalette';
 import { useLiveStatus } from './live';
@@ -114,6 +117,7 @@ export function Shell({ children }: { children: ReactNode }) {
           <LivePill />
           <Button variant="ghost" iconOnly icon={Search} aria-label="Open command palette" onClick={() => setPaletteOpen(true)} />
         </header>
+        <ReconnectBanner />
         {paused ? <PausedBanner /> : null}
         <main id="main" className="page" tabIndex={-1}>
           {children}
@@ -239,6 +243,36 @@ function GatewayCard() {
         {o.paused ? 'Resume gateway' : 'Pause gateway'}
       </Button>
     </section>
+  );
+}
+
+/**
+ * During a gateway outage or restart, pages keep their last known data; this
+ * banner says so and recovers on its own (polling + socket retry + silent re-auth).
+ */
+function ReconnectBanner() {
+  const overview = useOverview();
+  const { retry } = useLiveStatus();
+  const qc = useQueryClient();
+  const err = overview.error;
+  if (!overview.data || !(err instanceof ApiError) || err.kind !== 'network' || !overview.isError) return null;
+  return (
+    <div className="reconnect-banner" role="status">
+      <WifiOff aria-hidden />
+      <span>
+        <strong>Can’t reach the gateway.</strong> Showing the last known state. Reconnecting automatically.
+      </span>
+      <Button
+        size="sm"
+        icon={RefreshCw}
+        onClick={() => {
+          retry();
+          void qc.refetchQueries({ type: 'active' });
+        }}
+      >
+        Retry now
+      </Button>
+    </div>
   );
 }
 

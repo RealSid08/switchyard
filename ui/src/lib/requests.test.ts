@@ -38,7 +38,7 @@ describe('filters', () => {
   });
 
   it('round-trips through the URL and ignores junk', () => {
-    const f = { status: 'error' as const, model: 'a/b:c', transport: 'sse' as const, connection: 'c1', query: 'x y' };
+    const f = { status: 'error' as const, model: 'a/b:c', transport: 'sse' as const, connection: 'c1', query: 'x y', retried: true };
     expect(filtersFromSearch(filtersToSearch(f))).toEqual(f);
     expect(filtersToSearch(EMPTY_FILTERS)).toBe('');
     expect(filtersFromSearch('?status=bogus&transport=carrier-pigeon')).toEqual(EMPTY_FILTERS);
@@ -61,7 +61,7 @@ describe('mergeRequests', () => {
 describe('summarize', () => {
   it('computes counts and latency percentiles', () => {
     const s = summarize(Array.from({ length: 100 }, (_, i) => rec({ id: String(i), latency_ms: i + 1, status: i < 10 ? 500 : 200 })));
-    expect(s).toEqual({ total: 100, errors: 10, p50: 51, p95: 96 });
-    expect(summarize([])).toEqual({ total: 0, errors: 0, p50: null, p95: null });
+    expect(s).toEqual({ total: 100, errors: 10, retried: 0, p50: 51, p95: 96 });
+    expect(summarize([])).toEqual({ total: 0, errors: 0, retried: 0, p50: null, p95: null });
   });
 });

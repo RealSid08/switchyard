@@ -1,5 +1,5 @@
 import { useQueryClient } from '@tanstack/react-query';
-import { Eye, EyeOff, KeyRound, RefreshCw, ServerOff, ShieldAlert } from 'lucide-react';
+import { Eye, EyeOff, KeyRound, LogIn, RefreshCw, ServerOff, ShieldAlert } from 'lucide-react';
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { CodeBlock } from '../components/Code';
 import { BrandMark } from '../components/BrandMark';
@@ -9,10 +9,10 @@ import { api, onUnauthorized } from '../lib/client';
 
 interface AuthContextValue {
   mode: 'cookie' | 'token';
-  signOut: () => void;
+  signOut: () => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextValue>({ mode: 'cookie', signOut: () => {} });
+const AuthContext = createContext<AuthContextValue>({ mode: 'cookie', signOut: async () => {} });
 
 export function useAuth() {
   return useContext(AuthContext);
@@ -20,8 +20,9 @@ export function useAuth() {
 
 export function AuthProvider({ children }: { children: (ready: boolean) => ReactNode }) {
   const qc = useQueryClient();
-  const [state, setState] = useState<AuthState>({ status: 'checking' });
+  const [state, setState] = useState<AuthState | { status: 'signed-out'; mode: 'cookie' | 'token' }>({ status: 'checking' });
   const inflight = useRef<Promise<AuthState> | null>(null);
+  const signedOut = useRef(false);
 
   const run = useCallback(() => {
     inflight.current ??= bootstrapSession(api, tokenStore).finally(() => {
@@ -43,6 +44,7 @@ export function AuthProvider({ children }: { children: (ready: boolean) => React
   useEffect(
     () =>
       onUnauthorized(() => {
+        if (signedOut.current) return;
         void run().then((s) => {
           setState(s);
           if (s.status === 'ready') void qc.invalidateQueries();
@@ -58,16 +60,52 @@ export function AuthProvider({ children }: { children: (ready: boolean) => React
     return () => window.clearTimeout(t);
   }, [state, run]);
 
-  const signOut = useCallback(() => {
+  // Sign out ends this browser's server session, forgets any pasted token and drops
+  // every cached response. On the gateway machine a fresh session is one click away
+  // (the screen says so rather than silently signing back in).
+  const signOut = useCallback(async () => {
+    const mode = state.status === 'ready' ? state.mode : 'cookie';
+    signedOut.current = true;
+    await api.logout().catch(() => {});
     tokenStore.clear();
     qc.clear();
+    setState({ status: 'signed-out', mode });
+  }, [qc, state]);
+
+  const signInAgain = useCallback(() => {
+    signedOut.current = false;
+    setState({ status: 'checking' });
     void run().then(setState);
-  }, [qc, run]);
+  }, [run]);
 
   if (state.status === 'checking') return <Boot />;
+  if (state.status === 'signed-out') return <SignedOut local={state.mode === 'cookie'} onSignIn={signInAgain} />;
   if (state.status === 'needs-token') return <TokenGate reason={state.reason} onReady={setState} />;
   if (state.status === 'error') return <ErrorGate state={state} onRetry={() => run().then(setState)} />;
   return <AuthContext.Provider value={{ mode: state.mode, signOut }}>{children(true)}</AuthContext.Provider>;
+}
+
+/** `local`: the session came from the loopback cookie bootstrap, not a pasted token. */
+function SignedOut({ local, onSignIn }: { local: boolean; onSignIn: () => void }) {
+  return (
+    <main className="gate">
+      <div className="gate-card">
+        <GateBrand />
+        <div className="stack-sm">
+          <h1>You’re signed out</h1>
+          <p>
+            {local
+              ? 'Your admin session ended and cached data was cleared. Because this browser is on the gateway machine, signing back in takes one click, and reloading the page will also sign you in automatically.'
+              : 'Your admin session ended, cached data was cleared and the admin token was removed from this tab.'}
+          </p>
+        </div>
+        <Button variant="primary" icon={LogIn} onClick={onSignIn} block data-autofocus autoFocus>
+          {local ? 'Sign in again' : 'Sign in with a token'}
+        </Button>
+        <p className="small muted">The gateway keeps running and serving your clients while you’re signed out.</p>
+      </div>
+    </main>
+  );
 }
 
 function Boot() {

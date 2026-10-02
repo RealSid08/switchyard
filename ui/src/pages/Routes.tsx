@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, CircleAlert, FlaskConical, Pencil, Plus, RefreshCw, Repeat, ShieldCheck, Trash2, TriangleAlert, Waypoints, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, CircleAlert, FlaskConical, Pencil, Plus, RefreshCw, Repeat, ShieldCheck, Timer, Trash2, TriangleAlert, Waypoints, X } from 'lucide-react';
 import { useMemo, useState, type FormEvent } from 'react';
 import { useConnections, useDeleteRoute, useModels, useRoutes, useSaveRoute } from '../app/queries';
 import { navigate, useLocation } from '../app/router';
@@ -8,6 +8,7 @@ import { Menu } from '../components/Menu';
 import { Badge, Button, Callout, EmptyState, Field, KindMark, PageHead, Skeleton } from '../components/ui';
 import { errorMessage } from '../lib/api';
 import { displayNames } from '../lib/connections';
+import { formatSeconds } from '../lib/health';
 import { directModels, moveItem, routeHealth, targetIssue, validateRoute, type RouteDraft, type RouteErrors } from '../lib/routes';
 import type { Connection, Route, RouteStrategy } from '../lib/types';
 
@@ -57,7 +58,7 @@ export function RoutesPage() {
             </div>
           ))}
         </div>
-      ) : routes.isError ? (
+      ) : routes.isError && !routes.data ? (
         <Callout tone="err" title="Couldn’t load routes" role="alert" action={<Button size="sm" icon={RefreshCw} onClick={() => routes.refetch()}>Retry</Button>}>
           {errorMessage(routes.error)}
         </Callout>
@@ -216,12 +217,26 @@ function RouteCard({ route: r, connections, names, onEdit }: { route: Route; con
                   <TriangleAlert aria-hidden width={13} height={13} />
                   {issue === 'disabled' ? 'disabled' : issue === 'model-missing' ? 'model removed from connection' : 'connection deleted'}
                 </span>
+              ) : c ? (
+                <TargetCooling connection={c} model={t.model} />
               ) : null}
             </li>
           );
         })}
       </ol>
     </li>
+  );
+}
+
+/** A target that's temporarily benched: Switchyard skips it until the cooldown ends. */
+function TargetCooling({ connection, model }: { connection: Connection; model: string }) {
+  const cd = connection.health?.cooldowns.find((x) => x.model === '*' || x.model === model);
+  if (!cd || cd.retry_after_seconds <= 0) return null;
+  return (
+    <span className="target-issue" title="Benched after a rate limit or failure. Requests skip this target until the cooldown ends.">
+      <Timer aria-hidden width={13} height={13} />
+      {cd.model === '*' ? 'account cooling' : 'cooling'} · {formatSeconds(cd.retry_after_seconds)}
+    </span>
   );
 }
 

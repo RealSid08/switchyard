@@ -2,7 +2,7 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## [0.1.0] - 2026-10-02
 
 Initial release.
 
@@ -26,7 +26,8 @@ Initial release.
 - Embedded React control room: overview, connections, routes, activity, playground, keys, client setup and settings, with live updates.
 - Loopback default, hashed client keys, per-browser admin sessions with logout, strict origin checks, private data directory guarded by a single-process lock, and a validated admin token.
 - Body limits of 64 MiB for inference and 8 MiB for administration; 16 MiB response and SSE event limits; shared concurrency budget.
-- Metadata-only request history (newest 1,000) with lifetime counters.
+- Metadata-only request history (newest 1,000) with lifetime counters, bounded attempt traces and first-byte/first-output timing.
+- Per-account cooldown health, credential expiry and bounded provider model discovery.
 
 ### Project
 

@@ -97,6 +97,10 @@ impl Resilience {
         entries
     }
     pub fn remember(&mut self, response: &str, connection: &str) {
+        if response.is_empty() || response.len() > 256 || connection.len() > 256 {
+            tracing::warn!("Response affinity identifier exceeds its size limit");
+            return;
+        }
         self.prune();
         if self.affinity.len() >= 4096
             && let Some(old) = self

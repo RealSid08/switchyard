@@ -598,25 +598,76 @@ async fn settings(State(app): State<App>, Json(v): Json<Value>) -> Result<Json<V
     let _ = app.events.send(json!({"type":"overview","data":overview}));
     Ok(Json(overview))
 }
+/// The newest retained request involving `connection_id`, as `(timestamp, status, error)`.
+///
+/// A request counts if the connection served it or was attempted and failed over. For the
+/// connection that finished the request, the request's own outcome is used (a stream can fail
+/// after a 200 attempt); for one that was only tried, its last attempt in that request. Attempt
+/// errors are constant labels, never provider text. Only the retained history (newest 1,000
+/// requests) is consulted.
+fn connection_history<'a>(
+    records: &'a [crate::store::RequestRecord],
+    connection_id: &str,
+) -> Option<(&'a str, u16, Option<&'a str>)> {
+    records.iter().find_map(|record| {
+        if record.connection_id == connection_id {
+            return Some((
+                record.timestamp.as_str(),
+                record.status,
+                record.error.as_deref(),
+            ));
+        }
+        record
+            .attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.connection_id == connection_id)
+            .map(|attempt| {
+                (
+                    record.timestamp.as_str(),
+                    attempt.status,
+                    attempt.error.as_deref(),
+                )
+            })
+    })
+}
 async fn connections(State(app): State<App>) -> Json<Value> {
     let records = app.store.requests(1000);
     let connections: Vec<Connection> = app.store.list("connection");
     let mut resilience = app.resilience.lock().expect("resilience lock");
-    let values: Vec<Value> = connections.iter().map(|connection| {
-        let mut value = connection.public();
-        let recent = records.iter().find(|record| record.connection_id == connection.id);
-        let cooldowns = resilience.cooldowns(&connection.id);
-        let account_cooling = cooldowns.iter().any(|(model,_)| model == "*");
-        value["health"] = json!({
-            "status":if !connection.enabled {"disabled"} else if account_cooling {"cooling"} else if !cooldowns.is_empty() {"limited"} else {"ready"},
-            "cooldowns":cooldowns.iter().map(|(model,seconds)| json!({"model":model,"retry_after_seconds":seconds})).collect::<Vec<_>>(),
-            "last_used_at":recent.map(|record| &record.timestamp),
-            "last_status":recent.map(|record| record.status),
-            "last_error":recent.and_then(|record| record.error.as_deref()),
-        });
-        value["credential_expires_at"] = if connection.expires_at > 0 {json!(connection.expires_at)} else {Value::Null};
-        value
-    }).collect();
+    let values: Vec<Value> = connections
+        .iter()
+        .map(|connection| {
+            let mut value = connection.public();
+            let recent = connection_history(&records, &connection.id);
+            let cooldowns = resilience.cooldowns(&connection.id);
+            let account_cooling = cooldowns.iter().any(|(model, _)| model == "*");
+            value["health"] = json!({
+                "status": if !connection.enabled {
+                    "disabled"
+                } else if account_cooling {
+                    "cooling"
+                } else if !cooldowns.is_empty() {
+                    "limited"
+                } else {
+                    "ready"
+                },
+                "cooldowns": cooldowns
+                    .iter()
+                    .map(|(model, seconds)| json!({"model": model, "retry_after_seconds": seconds}))
+                    .collect::<Vec<_>>(),
+                "last_used_at": recent.map(|(at, _, _)| at),
+                "last_status": recent.map(|(_, status, _)| status),
+                "last_error": recent.and_then(|(_, _, error)| error),
+            });
+            value["credential_expires_at"] = if connection.expires_at > 0 {
+                json!(connection.expires_at)
+            } else {
+                Value::Null
+            };
+            value
+        })
+        .collect();
     Json(json!(values))
 }
 #[derive(Deserialize)]
@@ -874,7 +925,10 @@ async fn catalog_page(
         .await
         .map_err(|e| {
             if e.is_timeout() {
-                ApiError::new(504, "Provider model catalog timed out; enter model identifiers manually")
+                ApiError::new(
+                    504,
+                    "Provider model catalog timed out; enter model identifiers manually",
+                )
             } else {
                 unreachable()
             }
@@ -905,14 +959,21 @@ async fn catalog_page(
         return Err(ApiError::new(code, CATALOG_UNAVAILABLE));
     }
     let too_large = || ApiError::upstream("Provider model catalog exceeds 2 MiB");
-    if response.content_length().is_some_and(|n| n as usize > budget) {
+    if response
+        .content_length()
+        .is_some_and(|n| n as usize > budget)
+    {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
     loop {
         let chunk = tokio::time::timeout(catalog_remaining(deadline)?, response.chunk())
             .await
-            .map_err(|_| catalog_remaining(deadline).err().unwrap_or_else(unreachable))?
+            .map_err(|_| {
+                catalog_remaining(deadline)
+                    .err()
+                    .unwrap_or_else(unreachable)
+            })?
             .map_err(|_| ApiError::upstream("Provider model catalog interrupted"))?;
         let Some(chunk) = chunk else { break };
         if bytes.len() + chunk.len() > budget {
@@ -956,7 +1017,11 @@ async fn discover_models(
         credentials::refresh(&app, &mut connection),
     )
     .await
-    .map_err(|_| catalog_remaining(deadline).err().unwrap_or(ApiError::new(504, CATALOG_UNAVAILABLE)))?
+    .map_err(|_| {
+        catalog_remaining(deadline)
+            .err()
+            .unwrap_or(ApiError::new(504, CATALOG_UNAVAILABLE))
+    })?
     .map_err(management_error)?;
 
     let mut models = std::collections::BTreeMap::<String, String>::new();
@@ -979,7 +1044,9 @@ async fn discover_models(
             Ok(bytes) => bytes,
             Err(e) if page_index == 0 => return Err(e),
             Err(_) => {
-                truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+                truncated = Some(
+                    "The provider's catalog could only be read in part. Add any missing models manually.",
+                );
                 break;
             }
         };
@@ -990,17 +1057,24 @@ async fn discover_models(
                 return Err(ApiError::upstream("Invalid provider model catalog"));
             }
             Err(_) => {
-                truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+                truncated = Some(
+                    "The provider's catalog could only be read in part. Add any missing models manually.",
+                );
                 break;
             }
         };
-        let Some(entries) = page["data"].as_array().or_else(|| page["models"].as_array()) else {
+        let Some(entries) = page["data"]
+            .as_array()
+            .or_else(|| page["models"].as_array())
+        else {
             if page_index == 0 {
                 return Err(ApiError::upstream(
                     "Unsupported provider model catalog; enter model identifiers manually",
                 ));
             }
-            truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+            truncated = Some(
+                "The provider's catalog could only be read in part. Add any missing models manually.",
+            );
             break;
         };
         for (id, name) in entries.iter().filter_map(catalog_entry) {
@@ -1018,23 +1092,33 @@ async fn discover_models(
             None => {
                 // OpenAI-style lists may report more results without a documented cursor.
                 if page["has_more"] == true && connection.kind != "anthropic" {
-                    truncated = Some("The provider reported more models than it returned. Add any missing models manually.");
+                    truncated = Some(
+                        "The provider reported more models than it returned. Add any missing models manually.",
+                    );
                 } else if page["has_more"] == true || page["nextPageToken"].is_string() {
-                    truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+                    truncated = Some(
+                        "The provider's catalog could only be read in part. Add any missing models manually.",
+                    );
                 }
                 break;
             }
             Some(next) => {
                 if !seen_cursors.insert(next.clone()) {
-                    truncated = Some("The provider repeated a catalog page; showing the models read so far.");
+                    truncated = Some(
+                        "The provider repeated a catalog page; showing the models read so far.",
+                    );
                     break;
                 }
                 if page_index + 1 == CATALOG_PAGES {
-                    truncated = Some("The provider's catalog has more pages than Switchyard reads. Add any missing models manually.");
+                    truncated = Some(
+                        "The provider's catalog has more pages than Switchyard reads. Add any missing models manually.",
+                    );
                     break;
                 }
                 if catalog_remaining(deadline).is_err() {
-                    truncated = Some("The provider's catalog took too long to read in full. Add any missing models manually.");
+                    truncated = Some(
+                        "The provider's catalog took too long to read in full. Add any missing models manually.",
+                    );
                     break;
                 }
                 cursor = Some(next);

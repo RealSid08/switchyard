@@ -7,7 +7,10 @@ import type {
   GatewayConfig,
   ImportResult,
   ImportSource,
+  ModelCatalog,
   ModelInfo,
+  OAuthFlow,
+  OAuthProvider,
   Overview,
   RequestRecord,
   Route,
@@ -59,6 +62,7 @@ const STATUS_MESSAGES: Record<number, string> = {
   404: 'Not found.',
   409: 'That conflicts with something that already exists.',
   413: 'That request is too large.',
+  424: 'The provider rejected this account’s credentials.',
   429: 'Too many requests. Try again in a moment.',
   500: 'The gateway hit an internal error.',
   502: 'The upstream provider returned a bad response.',
@@ -180,6 +184,8 @@ export function createApiClient(opts: ApiClientOptions = {}) {
     raw,
     request,
     session: (o?: RequestOptions) => request<unknown>('/api/session', o),
+    /** End this browser's admin session (clears the HttpOnly cookie). */
+    logout: () => request<unknown>('/api/session', { method: 'DELETE', token: null, silent401: true }),
     /** Exchange an admin token for the HttpOnly session cookie (also enables /api/events). */
     mintSession: (token: string) => request<unknown>('/api/session', { method: 'POST', body: {}, token, silent401: true }),
     overview: (o?: RequestOptions) => request<Overview>('/api/overview', o),
@@ -191,10 +197,17 @@ export function createApiClient(opts: ApiClientOptions = {}) {
     updateConnection: (id: string, body: ConnectionInput) =>
       request<Connection>(`/api/connections/${enc(id)}`, { method: 'PUT', body }),
     deleteConnection: (id: string) => request<void>(`/api/connections/${enc(id)}`, { method: 'DELETE' }),
+    /** Read-only catalog from the provider using the stored credential. 424 = provider rejected the credential. */
+    discoverModels: (id: string, signal?: AbortSignal) => request<ModelCatalog>(`/api/connections/${enc(id)}/models`, { signal }),
     testConnection: (id: string) =>
       request<ConnectionTestResult>(`/api/connections/${enc(id)}/test`, { method: 'POST', body: {} }),
     importCredentials: (source: ImportSource, path?: string) =>
       request<ImportResult>('/api/import', { method: 'POST', body: path ? { source, path } : { source } }),
+
+    oauthStart: (provider: OAuthProvider) => request<OAuthFlow>('/api/oauth/start', { method: 'POST', body: { provider } }),
+    oauthStatus: (id: string, signal?: AbortSignal) => request<OAuthFlow>(`/api/oauth/${enc(id)}`, { signal }),
+    oauthCancel: (id: string) => request<OAuthFlow>(`/api/oauth/${enc(id)}`, { method: 'DELETE' }),
+    oauthCallback: (id: string, input: string) => request<OAuthFlow>(`/api/oauth/${enc(id)}/callback`, { method: 'POST', body: { input } }),
 
     models: () => request<ModelInfo[]>('/api/models'),
     routes: () => request<Route[]>('/api/routes'),
@@ -209,6 +222,7 @@ export function createApiClient(opts: ApiClientOptions = {}) {
       if (q.model) p.set('model', q.model);
       return request<RequestRecord[]>(`/api/requests?${p}`);
     },
+    requestDetail: (id: string) => request<RequestRecord>(`/api/requests/${enc(id)}`),
 
     keys: () => request<ApiKey[]>('/api/keys'),
     createKey: (name: string) => request<CreatedApiKey>('/api/keys', { method: 'POST', body: { name } }),

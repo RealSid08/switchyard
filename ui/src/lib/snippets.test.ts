@@ -85,6 +85,20 @@ describe('buildGuide', () => {
   });
 });
 
+describe('gemini guide', () => {
+  const urls = resolveGatewayUrls(cfg, loc);
+  it('uses x-goog-api-key and the gateway origin as SDK base URL', () => {
+    const g = buildGuide('gemini', { urls, model: 'gemini-3-pro' });
+    const all = g.blocks.map((b) => b.code).join('\n');
+    expect(all).toContain('base_url="http://127.0.0.1:7410"');
+    expect(all).toContain('baseUrl: "http://127.0.0.1:7410"');
+    expect(all).toContain('x-goog-api-key: $SWITCHYARD_API_KEY');
+    expect(all).toContain('/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse');
+    expect(g.notes.join(' ')).toMatch(/hasn’t been verified against a live Gemini account/);
+    expect(buildGuide('curl', { urls, model: 'g' }).blocks[3].code).toContain('x-goog-api-key');
+  });
+});
+
 describe('kindMismatch', () => {
   it('warns when a client cannot natively speak to the provider', () => {
     expect(kindMismatch('anthropic', 'codex')).toBe(true);
@@ -92,6 +106,8 @@ describe('kindMismatch', () => {
     expect(kindMismatch('openai', 'anthropic')).toBe(true);
     expect(kindMismatch('openai', 'codex')).toBe(false);
     expect(kindMismatch('any', 'gemini')).toBe(false);
+    expect(kindMismatch('gemini', 'gemini')).toBe(false);
+    expect(kindMismatch('gemini', 'codex')).toBe(true);
     expect(kindMismatch('openai', null)).toBe(false);
   });
 });

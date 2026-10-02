@@ -614,7 +614,9 @@ async fn health_reflects_cooldowns_per_model_and_account_and_clears_on_save() {
     let h = health(&gw, &ca).await["health"].clone();
     assert_eq!(h["status"], "ready", "{h}");
     assert_eq!(h["cooldowns"], json!([]));
-    assert_eq!(h["last_status"], 200, "history is kept: {h}");
+    // History is kept: A's newest involvement was the attempt that was rejected and failed over.
+    assert_eq!(h["last_status"], 401, "{h}");
+    assert_eq!(h["last_error"], "auth_rejected", "{h}");
 }
 
 #[tokio::test]
@@ -777,4 +779,543 @@ async fn anthropic_count_tokens_is_proxied_natively() {
             .status(),
         401
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Catalog pagination
+// ---------------------------------------------------------------------------------------------
+
+fn query_of(c: &Captured) -> HashMap<String, String> {
+    url::form_urlencoded::parse(c.query.as_deref().unwrap_or("").as_bytes())
+        .into_owned()
+        .collect()
+}
+
+/// A paged catalog: `pages(cursor)` returns the JSON for the page after `cursor`.
+fn paged(
+    pages: impl Fn(Option<String>) -> Response + Send + Sync + Clone + 'static,
+    cursor_param: &'static str,
+) -> Router {
+    Router::new().route(
+        "/models",
+        get(move |Query(q): Query<HashMap<String, String>>| {
+            let pages = pages.clone();
+            async move { pages(q.get(cursor_param).cloned()) }
+        }),
+    )
+}
+
+fn anthropic_page(ids: std::ops::Range<usize>, has_more: bool) -> Response {
+    let data: Vec<Value> = ids.clone().map(|i| json!({"type":"model","id":format!("claude-{i:04}"),"display_name":format!("Claude {i}")})).collect();
+    json_response(
+        200,
+        json!({"data":data,"has_more":has_more,"first_id":data.first().map(|d| d["id"].clone()),"last_id":data.last().map(|d| d["id"].clone())}),
+    )
+}
+
+#[tokio::test]
+async fn anthropic_catalog_follows_after_id_with_the_documented_page_size() {
+    let (_d, gw) = setup().await;
+    let up = Upstream::start(paged(
+        |after| match after.as_deref() {
+            None => anthropic_page(0..3, true),
+            Some("claude-0002") => anthropic_page(3..6, true),
+            Some("claude-0005") => anthropic_page(6..7, false),
+            Some(other) => json_response(400, json!({"error":format!("bad cursor {other}")})),
+        },
+        "after_id",
+    ))
+    .await;
+    let id = gw
+        .connection("Claude", "anthropic", &up.base(), &["kept"])
+        .await;
+    let (s, v, text) = discover(&gw, &id).await;
+    assert_eq!(s, 200, "{text}");
+    assert_eq!(
+        ids(&v),
+        (0..7).map(|i| format!("claude-{i:04}")).collect::<Vec<_>>()
+    );
+    assert_eq!(v["models"][6]["name"], "Claude 6");
+    assert!(
+        v.get("truncated").is_none() && v.get("message").is_none(),
+        "complete catalogs are not flagged: {v}"
+    );
+    let queries: Vec<_> = up.requests().iter().map(query_of).collect();
+    assert_eq!(queries.len(), 3);
+    assert!(queries.iter().all(|q| q["limit"] == "1000"), "{queries:?}");
+    assert_eq!(queries[0].get("after_id"), None);
+    assert_eq!(queries[1]["after_id"], "claude-0002");
+    assert_eq!(queries[2]["after_id"], "claude-0005");
+    assert!(
+        up.requests()
+            .iter()
+            .all(|r| r.path == "/models" && r.header("x-api-key").as_deref() == Some(PROVIDER_KEY))
+    );
+    assert_eq!(stored_models(&gw, &id).await, json!(["kept"]));
+}
+
+#[tokio::test]
+async fn gemini_catalog_follows_page_tokens_until_none() {
+    let (_d, gw) = setup().await;
+    let up = Upstream::start(paged(
+        |token| {
+            let (range, next) = match token.as_deref() {
+                None => (0..2, Some("tok/1+=")),
+                Some("tok/1+=") => (2..4, Some("tok-2")),
+                Some("tok-2") => (4..5, None),
+                Some(_) => return json_response(400, json!({})),
+            };
+            let models: Vec<Value> = range.map(|i| json!({"name":format!("models/gemini-{i}"),"displayName":format!("Gemini {i}")})).collect();
+            let mut body = json!({"models":models});
+            if let Some(n) = next {
+                body["nextPageToken"] = json!(n);
+            }
+            json_response(200, body)
+        },
+        "pageToken",
+    ))
+    .await;
+    let id = gw
+        .connection("Gemini", "gemini", &up.base(), &["kept"])
+        .await;
+    let (s, v, text) = discover(&gw, &id).await;
+    assert_eq!(s, 200, "{text}");
+    assert_eq!(
+        ids(&v),
+        ["gemini-0", "gemini-1", "gemini-2", "gemini-3", "gemini-4"]
+    );
+    assert!(v.get("truncated").is_none());
+    let queries: Vec<_> = up.requests().iter().map(query_of).collect();
+    assert!(queries.iter().all(|q| q["pageSize"] == "1000"));
+    assert_eq!(
+        queries[1]["pageToken"], "tok/1+=",
+        "cursor sent verbatim as an encoded query value"
+    );
+    assert_eq!(queries.len(), 3);
+}
+
+#[tokio::test]
+async fn endless_and_repeating_cursors_are_bounded_and_flagged() {
+    let (_d, gw) = setup().await;
+    let endless = Upstream::start(paged(
+        |token| {
+            let n: usize = token.as_deref().and_then(|t| t.strip_prefix("p")).and_then(|t| t.parse().ok()).unwrap_or(0);
+            json_response(200, json!({"models":[{"name":format!("models/m-{n}")}],"nextPageToken":format!("p{}", n + 1)}))
+        },
+        "pageToken",
+    ))
+    .await;
+    let cycle = Upstream::start(paged(
+        |after| {
+            let id = if after.is_some() {
+                "claude-b"
+            } else {
+                "claude-a"
+            };
+            // Always points at the same cursor: a provider bug that must not loop.
+            json_response(
+                200,
+                json!({"data":[{"id":id}],"has_more":true,"last_id":"claude-a"}),
+            )
+        },
+        "after_id",
+    ))
+    .await;
+    let e = gw
+        .connection("Endless", "gemini", &endless.base(), &["kept"])
+        .await;
+    let c = gw
+        .connection("Cycle", "anthropic", &cycle.base(), &["kept"])
+        .await;
+
+    let (s, v, _) = discover(&gw, &e).await;
+    assert_eq!(s, 200);
+    assert_eq!(endless.count(), 5, "at most five pages");
+    assert_eq!(ids(&v).len(), 5);
+    assert_eq!(v["truncated"], true);
+    assert!(
+        v["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("manually")),
+        "{v}"
+    );
+
+    let (s, v, _) = discover(&gw, &c).await;
+    assert_eq!(s, 200);
+    assert_eq!(cycle.count(), 2, "a repeated cursor stops pagination");
+    assert_eq!(ids(&v), ["claude-a", "claude-b"]);
+    assert_eq!(v["truncated"], true);
+}
+
+#[tokio::test]
+async fn identifier_and_byte_budgets_span_all_pages() {
+    let (_d, gw) = setup().await;
+    // 600 valid ids per page plus invalid entries that must not count toward the 1,000.
+    let ids_up = Upstream::start(paged(
+        |token| {
+            let page: usize = token.as_deref().map_or(0, |t| t.parse().unwrap());
+            let mut models: Vec<Value> = (0..600)
+                .map(|i| json!({"name":format!("models/p{page}-{i:03}")}))
+                .collect();
+            models.extend([
+                json!({"name":""}),
+                json!({"name":"has space"}),
+                json!({"name":"tab\tid"}),
+                json!({"name":"x".repeat(201)}),
+            ]);
+            json_response(
+                200,
+                json!({"models":models,"nextPageToken":(page + 1).to_string()}),
+            )
+        },
+        "pageToken",
+    ))
+    .await;
+    // ~800 KB per page: the third page crosses the 2 MiB total.
+    let bytes_up = Upstream::start(paged(
+        |token| {
+            let page: usize = token.as_deref().map_or(0, |t| t.parse().unwrap());
+            let pad = "p".repeat(800 * 1024);
+            json_response(200, json!({"models":[{"name":format!("models/b-{page}"),"description":pad}],"nextPageToken":(page + 1).to_string()}))
+        },
+        "pageToken",
+    ))
+    .await;
+    let i = gw
+        .connection("Ids", "gemini", &ids_up.base(), &["kept"])
+        .await;
+    let b = gw
+        .connection("Bytes", "gemini", &bytes_up.base(), &["kept"])
+        .await;
+
+    let (s, v, _) = discover(&gw, &i).await;
+    assert_eq!(s, 200);
+    let got = ids(&v);
+    assert_eq!(got.len(), 1000);
+    assert!(
+        got.iter()
+            .all(|id| !id.contains(' ') && !id.contains('\t') && id.len() <= 200)
+    );
+    assert_eq!(
+        ids_up.count(),
+        2,
+        "stops once 1,000 valid identifiers are collected"
+    );
+    assert_eq!(v["truncated"], true);
+    assert!(v["message"].as_str().unwrap().contains("1,000"), "{v}");
+
+    let (s, v, text) = discover(&gw, &b).await;
+    assert_eq!(s, 200, "{text}");
+    assert_eq!(ids(&v), ["b-0", "b-1"], "pages within the budget are kept");
+    assert_eq!(v["truncated"], true);
+    assert_eq!(bytes_up.count(), 3);
+}
+
+#[tokio::test]
+async fn later_page_failures_keep_earlier_pages_without_leaks_or_admin_401() {
+    let (_d, gw) = setup().await;
+    let up = Upstream::start(
+        Router::new()
+            .route("/e500/models", get(|Query(q): Query<HashMap<String, String>>| async move {
+                if q.contains_key("after_id") {
+                    json_response(500, json!({"error":{"message":format!("boom {PROVIDER_KEY}")}}))
+                } else {
+                    json_response(200, json!({"data":[{"id":"claude-a"}],"has_more":true,"last_id":"claude-a"}))
+                }
+            }))
+            .route("/e401/models", get(|Query(q): Query<HashMap<String, String>>| async move {
+                if q.contains_key("after_id") {
+                    json_response(401, json!({"error":{"type":"authentication_error","message":"expired"}}))
+                } else {
+                    json_response(200, json!({"data":[{"id":"claude-a"}],"has_more":true,"last_id":"claude-a"}))
+                }
+            }))
+            .route("/junk/models", get(|Query(q): Query<HashMap<String, String>>| async move {
+                if q.contains_key("pageToken") {
+                    Response::builder().header("content-type", "application/json").body(Body::from("{not json")).unwrap()
+                } else {
+                    json_response(200, json!({"models":[{"name":"models/g-a"}],"nextPageToken":"t"}))
+                }
+            })),
+    )
+    .await;
+    for (name, kind, base, first) in [
+        (
+            "e500",
+            "anthropic",
+            format!("{}/e500", up.base()),
+            "claude-a",
+        ),
+        (
+            "e401",
+            "anthropic",
+            format!("{}/e401", up.base()),
+            "claude-a",
+        ),
+        ("junk", "gemini", format!("{}/junk", up.base()), "g-a"),
+    ] {
+        let id = gw.connection(name, kind, &base, &["kept"]).await;
+        let (s, v, text) = discover(&gw, &id).await;
+        assert_eq!(s, 200, "{name}: {text}");
+        assert_eq!(ids(&v), [first], "{name}");
+        assert_eq!(v["truncated"], true, "{name}");
+        assert!(
+            !text.contains(PROVIDER_KEY) && !text.contains("boom") && !text.contains("expired"),
+            "{name}: {text}"
+        );
+        assert_eq!(stored_models(&gw, &id).await, json!(["kept"]));
+    }
+    assert_eq!(gw.admin_get("/api/overview").await.status(), 200);
+}
+
+#[tokio::test]
+async fn openai_has_more_without_a_documented_cursor_is_flagged_not_followed() {
+    let (_d, gw) = setup().await;
+    let up = Upstream::start(catalog(
+        json!({"object":"list","data":[{"id":"gpt-a"}],"has_more":true,"last_id":"gpt-a"}),
+    ))
+    .await;
+    let id = gw
+        .connection("Compat", "openai", &up.base(), &["kept"])
+        .await;
+    let (s, v, _) = discover(&gw, &id).await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), ["gpt-a"]);
+    assert_eq!(v["truncated"], true);
+    assert_eq!(up.count(), 1);
+    assert_eq!(
+        up.requests()[0].query,
+        None,
+        "OpenAI catalogs are requested without paging parameters"
+    );
+}
+
+/// Cursors are opaque query values: a provider cannot redirect discovery to another host or path.
+#[tokio::test]
+async fn cursors_cannot_steer_requests_to_other_urls() {
+    let (_d, gw) = setup().await;
+    let elsewhere = Upstream::start(
+        Router::new()
+            .fallback(|| async { json_response(200, json!({"models":[{"name":"models/evil"}]})) }),
+    )
+    .await;
+    let target = format!("{}/steal?x=1", elsewhere.base());
+    let t = target.clone();
+    let up = Upstream::start(paged(
+        move |token| {
+            if token.is_none() {
+                json_response(200, json!({"models":[{"name":"models/safe"}],"nextPageToken":t.clone(),"next":t.clone(),"nextPageUrl":t.clone()}))
+            } else {
+                json_response(200, json!({"models":[{"name":"models/second"}]}))
+            }
+        },
+        "pageToken",
+    ))
+    .await;
+    let id = gw
+        .connection("Gemini", "gemini", &up.base(), &["kept"])
+        .await;
+    let (s, v, _) = discover(&gw, &id).await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), ["safe", "second"]);
+    assert_eq!(
+        elsewhere.count(),
+        0,
+        "discovery followed a provider-supplied URL"
+    );
+    let second = &up.requests()[1];
+    assert_eq!(second.path, "/models");
+    assert_eq!(
+        query_of(second)["pageToken"],
+        target,
+        "the URL-shaped cursor stays an opaque query value"
+    );
+}
+
+#[tokio::test]
+async fn discovery_has_one_deadline_across_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    // The catalog deadline is 20 s, or --timeout when shorter.
+    let gw = Gateway::start_with(dir.path(), 8, 2).await;
+    let up = Upstream::start(
+        Router::new()
+            .route(
+                "/slow2/models",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    if q.contains_key("pageToken") {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                    json_response(
+                        200,
+                        json!({"models":[{"name":"models/fast"}],"nextPageToken":"t"}),
+                    )
+                }),
+            )
+            .route(
+                "/slow1/models",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    json_response(200, json!({"models":[]}))
+                }),
+            ),
+    )
+    .await;
+    let partial = gw
+        .connection(
+            "Slow page 2",
+            "gemini",
+            &format!("{}/slow2", up.base()),
+            &["kept"],
+        )
+        .await;
+    let none = gw
+        .connection(
+            "Slow page 1",
+            "gemini",
+            &format!("{}/slow1", up.base()),
+            &["kept"],
+        )
+        .await;
+
+    let started = std::time::Instant::now();
+    let (s, v, text) = discover(&gw, &partial).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "deadline not enforced across pages"
+    );
+    assert_eq!(s, 200, "{text}");
+    assert_eq!(ids(&v), ["fast"]);
+    assert_eq!(v["truncated"], true);
+
+    let started = std::time::Instant::now();
+    let (s, v, text) = discover(&gw, &none).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(s, 504, "{text}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("manually"));
+}
+
+#[tokio::test]
+async fn catalog_display_names_and_ids_are_sanitised() {
+    let (_d, gw) = setup().await;
+    let up = Upstream::start(catalog(json!({"data":[
+        {"id":"good","display_name":"Good Model"},
+        {"id":"ctrl","display_name":"bad\u{0007}name"},
+        {"id":"long","display_name":"n".repeat(201)},
+        {"id":"blank","display_name":"   "},
+        {"id":"bad\nid"},
+        {"id":"models/kept-prefix-only-for-gemini"}
+    ]})))
+    .await;
+    let id = gw.connection("A", "anthropic", &up.base(), &["kept"]).await;
+    let (_, v, _) = discover(&gw, &id).await;
+    let names: HashMap<String, String> = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["id"].as_str().unwrap().into(),
+                m["name"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(names["good"], "Good Model");
+    assert_eq!(
+        names["ctrl"], "ctrl",
+        "names with control characters fall back to the id"
+    );
+    assert_eq!(names["long"], "long");
+    assert_eq!(names["blank"], "blank");
+    assert!(!names.contains_key("bad\nid"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Health from attempts
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_includes_failed_over_attempts_and_the_final_outcome() {
+    let (_d, gw) = setup().await;
+    let fail_a = Arc::new(Mutex::new(HashMap::from([(
+        "m".to_string(),
+        (503u16, Some("1")),
+    )])));
+    let a = Upstream::start(scripted(fail_a.clone())).await;
+    // B streams a response that ends without completion: the attempt was a 200, the request a 502.
+    let b = Upstream::start(scripted(Arc::new(Mutex::new(HashMap::new()))).route(
+        "/cut/responses",
+        post(|| async {
+            sse_response(Body::from(sse(&[
+                json!({"type":"response.created","response":{"id":"r"}}),
+            ])))
+        }),
+    ))
+    .await;
+    let ca = gw.connection("A", "openai", &a.base(), &["m"]).await;
+    let cb = gw.connection("B", "openai", &b.base(), &["m"]).await;
+    let cc = gw
+        .connection("Cut", "openai", &format!("{}/cut", b.base()), &["s"])
+        .await;
+    let t = |c: &str, m: &str| json!({"connection_id":c,"model":m});
+    gw.put_route("ha", "failover", json!([t(&ca, "m"), t(&cb, "m")]))
+        .await;
+    let (_, key) = gw.create_key("k").await;
+
+    assert_eq!(
+        gw.post("/v1/responses", &key, json!({"model":"ha","input":"x"}))
+            .await
+            .status(),
+        200
+    );
+    let log = gw.wait_for_log(1).await;
+    assert_eq!(log[0]["connection_id"], cb.as_str());
+    let ha = health(&gw, &ca).await["health"].clone();
+    assert_eq!(
+        ha["last_status"], 503,
+        "the failed-over attempt is A's latest activity: {ha}"
+    );
+    assert_eq!(ha["last_error"], "provider_unavailable");
+    assert_eq!(ha["last_used_at"], log[0]["timestamp"]);
+    let hb = health(&gw, &cb).await["health"].clone();
+    assert_eq!(
+        (hb["last_status"].clone(), hb["last_error"].clone()),
+        (json!(200), Value::Null)
+    );
+
+    // After A recovers and serves, its newest record wins.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    fail_a.lock().unwrap().clear();
+    assert_eq!(
+        gw.post("/v1/responses", &key, json!({"model":"ha","input":"x"}))
+            .await
+            .status(),
+        200
+    );
+    let log = gw.wait_for_log(2).await;
+    assert_eq!(log[0]["connection_id"], ca.as_str());
+    let ha = health(&gw, &ca).await["health"].clone();
+    assert_eq!(
+        (ha["last_status"].clone(), ha["last_error"].clone()),
+        (json!(200), Value::Null),
+        "{ha}"
+    );
+    assert_eq!(
+        health(&gw, &cb).await["health"]["last_used_at"],
+        hb["last_used_at"],
+        "B keeps its older record"
+    );
+
+    // The serving account reports the request's outcome, not just its attempt's status.
+    let r = gw
+        .post(
+            "/v1/responses",
+            &key,
+            json!({"model":"s","input":"x","stream":true}),
+        )
+        .await;
+    r.text().await.unwrap();
+    gw.wait_for_log(3).await;
+    let hc = health(&gw, &cc).await["health"].clone();
+    assert_eq!(hc["last_status"], 502, "{hc}");
+    assert!(hc["last_error"].as_str().is_some_and(|e| !e.is_empty()));
 }

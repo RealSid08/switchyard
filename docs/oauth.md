@@ -60,13 +60,14 @@ Open `authorization_url` in a browser on the machine running Switchyard. After y
 
 These ports are fixed because the providers only accept these registered redirect URIs. If a port is busy (for example `codex login` or a CLIProxyAPI login is running), `start` returns 409 and names the port.
 
-Status responses are `{id, provider, status, expires_in_seconds?, connection?, message?}`, where `status` is `pending`, `complete`, `error` or `expired`. On success, `connection` is the public view of the new or updated account. Authorization codes, PKCE verifiers and tokens are never returned or logged.
+Status responses are `{id, provider, status, expires_in_seconds?, connection?, message?}`, where `status` is `pending`, `complete`, `error` or `expired`. Token exchange remains `pending`; cancellation is an `error` with a cancellation message. On success, `connection` is the public view of the new or updated account. Authorization codes, PKCE verifiers and tokens are never returned or logged.
 
 How it behaves:
 
 - PKCE with S256 and a fresh verifier for every sign-in. `state` is compared in constant time.
 - The loopback listener accepts only loopback `Host` headers. A forged or mismatched callback is rejected without ending the sign-in.
 - One sign-in per provider at a time: starting another replaces the older one, unless the older one is already exchanging its code (409). At most 8 are pending. Each expires after 5 minutes, and its listener closes as soon as it completes, fails, is cancelled or expires.
+- Token exchange and account-lock waiting can be cancelled. Cancellation and account persistence share one commit point: a completed account stays complete, and a cancelled or expired flow never writes an account later. Token exchange has a separate 60-second deadline.
 - A sign-in belongs to the Switchyard instance that started it; finished sign-ins can be polled for 10 minutes.
 - A provider `error` callback ends the sign-in with a clear message. Token exchange and refresh calls time out after 20 seconds, and responses are capped at 256 KiB. Provider error bodies are never shown.
 - The browser page after the callback contains only static text.

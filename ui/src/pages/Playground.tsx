@@ -1,7 +1,7 @@
 import { CircleStop, FlaskConical, Plug, Send, Unplug, Wrench, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useConnections, useModels, useOverview, useRoutes } from '../app/queries';
-import { navigate, useLocation } from '../app/router';
+import { Link, navigate, useLocation } from '../app/router';
 import { CopyButton } from '../components/Code';
 import { Badge, Button, Callout, EmptyState, Field, PageHead, Segmented, Skeleton } from '../components/ui';
 import { api } from '../lib/client';
@@ -215,6 +215,16 @@ export function PlaygroundPage() {
 
         <section className="card output-card" aria-label="Response">
           <Metrics run={run} />
+          <p className="metrics-note muted xs">
+            Measured in this browser, including the hop to the gateway.{' '}
+            {run.metrics.total !== null ? (
+              <Link to="/activity" className="link">
+                Gateway-side upstream timings and attempts are in Activity.
+              </Link>
+            ) : (
+              'Gateway-side upstream timings and attempts are in Activity.'
+            )}
+          </p>
           <div className="tabs" role="tablist" aria-label="Response views">
             {(
               [

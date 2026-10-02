@@ -85,16 +85,19 @@ export function SettingsPage() {
           <div className="card-body stack">
             <p className="small">
               {auth.mode === 'cookie'
-                ? 'Signed in automatically because this browser is on the gateway machine. The session cookie is HttpOnly and scoped to the admin API.'
-                : 'Signed in with the admin token. It’s kept in this tab’s session storage and forgotten when the tab closes.'}
+                ? 'Signed in automatically because this browser is on the gateway machine. The session cookie is HttpOnly, scoped to the admin API, and expires after 12 hours.'
+                : 'Signed in with the admin token, which is kept in this tab’s session storage and forgotten when the tab closes. The browser session expires after 12 hours; the stored token renews it automatically.'}
             </p>
-            {auth.mode === 'token' ? (
-              <div>
-                <Button icon={LogOut} onClick={auth.signOut}>
-                  Forget token
-                </Button>
-              </div>
-            ) : null}
+            <div>
+              <Button icon={LogOut} onClick={() => void auth.signOut()}>
+                Sign out of this browser
+              </Button>
+            </div>
+            <p className="muted xs">
+              {auth.mode === 'cookie'
+                ? 'Ends this browser’s session and clears cached data. On this machine you can sign back in with one click.'
+                : 'Ends this browser’s session, removes the token from this tab and clears cached data.'}
+            </p>
           </div>
         </section>
 

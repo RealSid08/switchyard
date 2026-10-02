@@ -26,8 +26,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "pnpm build && playwright test --project=e2e",
-    "screenshots": "pnpm build && playwright test --project=screenshots"
+    "test:e2e": "pnpm build && node scripts/e2e.ts --project=e2e",
+    "screenshots": "pnpm build && node scripts/e2e.ts --project=screenshots"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.104.0",

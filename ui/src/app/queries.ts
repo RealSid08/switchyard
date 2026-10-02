@@ -48,8 +48,9 @@ export function useOverview() {
   return useQuery({ queryKey: qk.overview, queryFn: () => api.overview(), refetchInterval });
 }
 
-export function useConnections() {
-  return useQuery({ queryKey: qk.connections, queryFn: api.connections });
+/** `health: true` refreshes every 15 s so cooldowns and last-used stay current while visible. */
+export function useConnections(opts: { health?: boolean } = {}) {
+  return useQuery({ queryKey: qk.connections, queryFn: api.connections, refetchInterval: opts.health ? 15_000 : false });
 }
 
 export function useModels() {

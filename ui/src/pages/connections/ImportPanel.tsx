@@ -1,12 +1,14 @@
 import { useQueryClient } from '@tanstack/react-query';
-import { CircleCheck, FolderOpen, ShieldCheck } from 'lucide-react';
+import { Download, FolderOpen, LogIn, Plus, ShieldCheck } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
 import { qk, useImport } from '../../app/queries';
 import { useToast } from '../../components/feedback';
-import { Button, Callout, Field, KindMark } from '../../components/ui';
+import { Button, Callout, Field, KindMark, kindLabel } from '../../components/ui';
+import { navigate } from '../../app/router';
+import { SignInDialog } from './SignIn';
 import { errorMessage } from '../../lib/api';
 import { api } from '../../lib/client';
-import type { Connection, ImportResult, ImportSource } from '../../lib/types';
+import type { Connection, ImportResult, ImportSource, OAuthProvider } from '../../lib/types';
 
 export interface ImportOutcome {
   source: ImportSource;
@@ -94,11 +96,16 @@ export function ImportResultView({ outcome }: { outcome: ImportOutcome }) {
   );
 }
 
-export function ImportPanel({ onImported }: { onImported?: (o: ImportOutcome) => void }) {
+/**
+ * Every way to bring an account, in one place: browser sign-in or CLI import for
+ * subscriptions, API keys for providers, and CLIProxyAPI migration.
+ */
+export function ConnectOptions({ apiProviders = true }: { apiProviders?: boolean }) {
   const { run, outcome, pending } = useImportAction();
   const toast = useToast();
   const [path, setPath] = useState('');
   const [pathError, setPathError] = useState<string | null>(null);
+  const [signIn, setSignIn] = useState<OAuthProvider | null>(null);
 
   const go = async (source: ImportSource, p?: string) => {
     const o = await run(source, p);
@@ -108,7 +115,6 @@ export function ImportPanel({ onImported }: { onImported?: (o: ImportOutcome) =>
       title: `${source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude Code' : 'CLIProxyAPI'} import complete`,
       message: `${describeImport(o)} Original credential files were not modified.`,
     });
-    onImported?.(o);
   };
 
   const submitCliproxy = (e: FormEvent) => {
@@ -121,69 +127,109 @@ export function ImportPanel({ onImported }: { onImported?: (o: ImportOutcome) =>
     void go('cliproxy', path.trim());
   };
 
+  const accounts: { provider: OAuthProvider; source: ImportSource; kind: string; title: string; sub: string; cli: string }[] = [
+    { provider: 'codex', source: 'codex', kind: 'codex', title: 'ChatGPT', sub: 'Codex subscription', cli: 'Codex CLI' },
+    { provider: 'claude', source: 'claude', kind: 'anthropic', title: 'Claude', sub: 'Claude Pro or Max subscription', cli: 'Claude Code' },
+  ];
+
   return (
     <div className="stack">
-      <div className="import-grid">
-        <ImportTile
-          kind="codex"
-          title="Codex"
-          detail="ChatGPT sign-in from ~/.codex/auth.json"
-          busy={pending === 'codex'}
-          disabled={!!pending}
-          onClick={() => go('codex')}
-        />
-        <ImportTile
-          kind="anthropic"
-          title="Claude Code"
-          detail="~/.claude/.credentials.json or the macOS Keychain"
-          busy={pending === 'claude'}
-          disabled={!!pending}
-          onClick={() => go('claude')}
-        />
-      </div>
-      <form className="stack-sm" onSubmit={submitCliproxy}>
-        <Field
-          label="Migrating from CLIProxyAPI?"
-          htmlFor="cliproxy-path"
-          error={pathError ?? undefined}
-          hint="Path on the gateway machine to an auth .json file or the auth directory (up to 100 accounts)."
-        >
-          <div className="row">
-            <input
-              id="cliproxy-path"
-              className="input mono"
-              placeholder="~/.cli-proxy-api"
-              value={path}
-              onChange={(e) => setPath(e.target.value)}
-              aria-invalid={!!pathError || undefined}
-              autoComplete="off"
-              spellCheck={false}
-            />
-            <Button type="submit" icon={FolderOpen} loading={pending === 'cliproxy'} disabled={!!pending}>
-              Import
-            </Button>
-          </div>
-        </Field>
-      </form>
+      <ul className="account-rows" aria-label="Subscription accounts">
+        {accounts.map((a) => (
+          <li key={a.provider} className="account-row">
+            <KindMark kind={a.kind} size="lg" />
+            <div className="account-row-text">
+              <span className="account-row-title">{a.title}</span>
+              <span className="muted small">{a.sub}</span>
+            </div>
+            <div className="account-row-actions">
+              <Button
+                variant="primary"
+                icon={LogIn}
+                onClick={() => setSignIn(a.provider)}
+                disabled={!!pending}
+                aria-label={`Sign in with ${a.title} in the browser`}
+                data-autofocus={a.provider === 'codex' ? true : undefined}
+              >
+                Sign in
+              </Button>
+              <Button
+                icon={Download}
+                onClick={() => go(a.source)}
+                loading={pending === a.source}
+                disabled={!!pending && pending !== a.source}
+                aria-label={`Import ${a.cli} login`}
+              >
+                Import {a.cli}
+              </Button>
+            </div>
+          </li>
+        ))}
+      </ul>
+      <dl className="method-legend">
+        <div>
+          <dt>
+            <LogIn aria-hidden /> Sign in
+          </dt>
+          <dd>A fresh browser sign-in that Switchyard owns and keeps refreshed on its own. Works even from another computer.</dd>
+        </div>
+        <div>
+          <dt>
+            <Download aria-hidden /> Import
+          </dt>
+          <dd>Reuses the login your CLI already saved on the gateway machine, read-only. It follows that CLI: sign in there again if it expires.</dd>
+        </div>
+      </dl>
       {outcome ? <ImportResultView outcome={outcome} /> : null}
+
+      {apiProviders ? (
+        <div className="stack-sm">
+          <h3>Or add an API key</h3>
+          <div className="provider-buttons">
+            {(['openai', 'anthropic', 'gemini', 'compatible'] as const).map((id) => (
+              <button key={id} type="button" className="provider-button" onClick={() => navigate(`/connections?new=1&preset=${id}`)}>
+                <KindMark kind={id === 'compatible' ? 'openai' : id} size="sm" />
+                {id === 'compatible' ? 'OpenAI-compatible' : kindLabel(id)}
+                <Plus aria-hidden className="muted" />
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <details className="cliproxy">
+        <summary>Migrating from CLIProxyAPI?</summary>
+        <form className="stack-sm" onSubmit={submitCliproxy}>
+          <Field
+            label="Auth file or directory"
+            htmlFor="cliproxy-path"
+            error={pathError ?? undefined}
+            hint="A path on the gateway machine. Imports up to 100 accounts; each follows its CLIProxyAPI file."
+          >
+            <div className="row">
+              <input
+                id="cliproxy-path"
+                className="input mono"
+                placeholder="~/.cli-proxy-api"
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                aria-invalid={!!pathError || undefined}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <Button type="submit" icon={FolderOpen} loading={pending === 'cliproxy'} disabled={!!pending}>
+                Import
+              </Button>
+            </div>
+          </Field>
+        </form>
+      </details>
       <p className="trust-note">
         <ShieldCheck aria-hidden />
-        Imports read credentials on the machine running Switchyard and copy them into its private store. Your Codex, Claude and CLIProxyAPI files are never
-        modified, and importing the same account again refreshes it instead of creating a duplicate.
+        Credentials stay on the machine running Switchyard. Imports never modify your Codex, Claude or CLIProxyAPI files, and connecting the same account
+        again refreshes it instead of creating a duplicate.
       </p>
+      <SignInDialog provider={signIn} onClose={() => setSignIn(null)} />
     </div>
-  );
-}
-
-export function ImportTile({ kind, title, detail, busy, disabled, onClick, done }: { kind: string; title: string; detail: string; busy?: boolean; disabled?: boolean; onClick: () => void; done?: boolean }) {
-  return (
-    <button type="button" className="import-tile" onClick={onClick} disabled={disabled} aria-busy={busy || undefined}>
-      <KindMark kind={kind} size="lg" />
-      <span className="import-tile-text">
-        <span className="import-tile-title">Import {title}</span>
-        <span className="import-tile-detail">{detail}</span>
-      </span>
-      <span className="import-tile-cta">{busy ? 'Importing…' : done ? <CircleCheck aria-label="Imported" width={16} height={16} /> : 'One click'}</span>
-    </button>
   );
 }

@@ -115,6 +115,99 @@ for (const theme of THEMES) {
       c.assertClean();
     });
 
+    test(`sign-in and recovery · ${vp} · ${theme}`, async ({ page, context }) => {
+      const c = watchConsole(page);
+      await mock('seed');
+      await setup(page, vp, theme);
+      await page.goto('/connections?import=1');
+      await expect(page.getByRole('dialog', { name: 'Connect an account' })).toBeVisible();
+      await shot(page, '30-connect-account', vp, theme, { full: false });
+
+      await page.getByRole('button', { name: 'Sign in with ChatGPT in the browser' }).click();
+      const dialog = page.getByRole('dialog', { name: 'Sign in with ChatGPT' });
+      await expect(dialog.getByRole('link', { name: 'Open sign-in page' })).toBeVisible();
+      await shot(page, '31-signin-pending', vp, theme, { full: false });
+      await dialog.getByText('Signing in from a different computer').click();
+      await dialog.getByLabel('Callback address').fill('http://localhost:1455/auth/callback?state=abc');
+      await dialog.getByRole('button', { name: 'Finish' }).click();
+      await shot(page, '32-signin-paste', vp, theme, { full: false });
+      const [popup] = await Promise.all([context.waitForEvent('page'), dialog.getByRole('link', { name: 'Open sign-in page' }).click()]);
+      await popup.close();
+      await expect(dialog.getByText('New account connected.')).toBeVisible();
+      await shot(page, '33-signin-complete', vp, theme, { full: false });
+      await dialog.getByRole('button', { name: 'Done' }).click();
+      await page.keyboard.press('Escape');
+
+      await mock('oauth-busy');
+      await page.goto('/connections?signin=claude');
+      await expect(page.getByRole('dialog', { name: 'Sign in with Claude' }).getByRole('alert')).toBeVisible();
+      await shot(page, '34-signin-busy', vp, theme, { full: false });
+      await mock('oauth-free');
+
+      await page.goto('/connections');
+      await expect(page.locator('.conn-card').first()).toBeVisible();
+      const native = page.locator('.conn-card', { hasText: 'Claude Code' });
+      await native.getByRole('button', { name: 'Test' }).click();
+      await expect(native.getByText('Provider reachable')).toBeVisible();
+      await shot(page, '35-connections-sources', vp, theme, { full: true });
+
+      await page.route('**/api/**', (r) => r.abort('connectionrefused'));
+      await mock('drop-events');
+      await expect(page.locator('.reconnect-banner')).toBeVisible({ timeout: 25_000 });
+      await shot(page, '36-reconnecting', vp, theme, { full: false });
+      await page.unroute('**/api/**');
+      await mock('events-on');
+      await page.reload();
+
+      await page.goto('/settings');
+      await page.getByRole('button', { name: 'Sign out of this browser' }).click();
+      await expect(page.getByRole('heading', { name: 'You’re signed out' })).toBeVisible();
+      await shot(page, '37-signed-out', vp, theme, { full: false });
+      c.allow(/status of 40[09]|ERR_CONNECTION_REFUSED|WebSocket connection to .* failed/);
+      c.assertClean();
+    });
+
+    test(`health, catalogs and failovers · ${vp} · ${theme}`, async ({ page }) => {
+      const c = watchConsole(page);
+      await mock('seed');
+      await mock('cooldown');
+      await setup(page, vp, theme);
+      await page.goto('/connections');
+      await expect(page.locator('.health-chip').first()).toBeVisible();
+      await shot(page, '40-connections-health', vp, theme, { full: true });
+
+      const claude = page.locator('.conn-card', { hasText: 'Claude Code' });
+      await claude.getByRole('button', { name: /More actions/ }).click();
+      await page.getByRole('menuitem', { name: 'Choose models…' }).click();
+      const picker = page.getByRole('dialog', { name: 'Models for Claude Code' });
+      await expect(picker.getByText('8 offered by the provider')).toBeVisible();
+      await picker.getByRole('checkbox', { name: /claude-fable-5-1/ }).check();
+      await shot(page, '41-model-picker', vp, theme, { full: false });
+      await page.keyboard.press('Escape');
+
+      await mock('catalog-reject');
+      const gem = page.locator('.conn-card', { hasText: 'Gemini' });
+      await gem.getByRole('button', { name: /More actions/ }).click();
+      await page.getByRole('menuitem', { name: 'Choose models…' }).click();
+      await expect(page.getByRole('dialog', { name: 'Models for Gemini' }).getByRole('alert')).toBeVisible();
+      await shot(page, '42-model-picker-rejected', vp, theme, { full: false });
+      await mock('catalog-accept');
+
+      await page.goto('/activity?retried=1');
+      const first = page.locator(vp === 'mobile' ? '.activity-cards a' : '.activity-table tbody tr a').first();
+      await expect(first).toBeVisible();
+      await shot(page, '43-activity-retried', vp, theme, { full: false });
+      await first.click();
+      await expect(page.getByRole('region', { name: 'Upstream attempts' })).toBeVisible();
+      await shot(page, '44-request-attempts', vp, theme, { full: false });
+
+      await page.goto('/clients?client=gemini');
+      await expect(page.locator('pre').filter({ hasText: 'google.genai' })).toBeVisible();
+      await shot(page, '45-clients-gemini', vp, theme, { full: vp === 'mobile' });
+      c.allow(/status of 424/);
+      c.assertClean();
+    });
+
     test(`gates and banners · ${vp} · ${theme}`, async ({ page }) => {
       await fetch(`${MOCK_TOKEN}/api/__mock/reset`, { method: 'POST' });
       await setup(page, vp, theme);

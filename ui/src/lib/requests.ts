@@ -1,4 +1,5 @@
 import { outcome, statusCode, toMillis } from './format';
+import { wasRetried } from './health';
 import type { RequestRecord, Transport } from './types';
 
 export interface RequestFilters {
@@ -7,12 +8,14 @@ export interface RequestFilters {
   transport: 'all' | Transport;
   connection: string;
   query: string;
+  /** Only requests that failed over to another account or needed several attempts. */
+  retried: boolean;
 }
 
-export const EMPTY_FILTERS: RequestFilters = { status: 'all', model: '', transport: 'all', connection: '', query: '' };
+export const EMPTY_FILTERS: RequestFilters = { status: 'all', model: '', transport: 'all', connection: '', query: '', retried: false };
 
 export function hasActiveFilters(f: RequestFilters): boolean {
-  return f.status !== 'all' || !!f.model || f.transport !== 'all' || !!f.connection || !!f.query.trim();
+  return f.status !== 'all' || !!f.model || f.transport !== 'all' || !!f.connection || !!f.query.trim() || f.retried;
 }
 
 export function matchesFilters(r: RequestRecord, f: RequestFilters): boolean {
@@ -22,11 +25,21 @@ export function matchesFilters(r: RequestRecord, f: RequestFilters): boolean {
   }
   if (f.model && r.model !== f.model) return false;
   if (f.transport !== 'all' && r.transport !== f.transport) return false;
-  if (f.connection && r.connection_id !== f.connection) return false;
+  if (f.connection && r.connection_id !== f.connection && !(r.attempts ?? []).some((a) => a.connection_id === f.connection)) return false;
+  if (f.retried && !wasRetried(r)) return false;
   const q = f.query.trim().toLowerCase();
   if (q) {
     const code = statusCode(r.status);
-    const haystack = [r.id, r.model, r.connection_name ?? '', r.transport, code === null ? '' : String(code), r.error ?? '']
+    const haystack = [
+      r.id,
+      r.model,
+      r.route ?? '',
+      r.connection_name ?? '',
+      ...(r.attempts ?? []).flatMap((a) => [a.connection_name, a.model]),
+      r.transport,
+      code === null ? '' : String(code),
+      r.error ?? '',
+    ]
       .join(' ')
       .toLowerCase();
     // Every whitespace-separated term must match somewhere.
@@ -59,6 +72,7 @@ export function filtersFromSearch(search: string): RequestFilters {
     transport: transport === 'http' || transport === 'sse' || transport === 'websocket' ? transport : 'all',
     connection: p.get('connection') ?? '',
     query: p.get('q') ?? '',
+    retried: p.get('retried') === '1',
   };
 }
 
@@ -69,6 +83,7 @@ export function filtersToSearch(f: RequestFilters): string {
   if (f.transport !== 'all') p.set('transport', f.transport);
   if (f.connection) p.set('connection', f.connection);
   if (f.query.trim()) p.set('q', f.query.trim());
+  if (f.retried) p.set('retried', '1');
   const s = p.toString();
   return s ? `?${s}` : '';
 }
@@ -76,6 +91,7 @@ export function filtersToSearch(f: RequestFilters): string {
 export interface RequestStats {
   total: number;
   errors: number;
+  retried: number;
   p50: number | null;
   p95: number | null;
 }
@@ -83,5 +99,11 @@ export interface RequestStats {
 export function summarize(records: RequestRecord[]): RequestStats {
   const lat = records.map((r) => r.latency_ms).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
   const q = (p: number) => (lat.length ? lat[Math.min(lat.length - 1, Math.floor(p * lat.length))] : null);
-  return { total: records.length, errors: records.filter((r) => outcome(r) === 'error').length, p50: q(0.5), p95: q(0.95) };
+  return {
+    total: records.length,
+    errors: records.filter((r) => outcome(r) === 'error').length,
+    retried: records.filter(wasRetried).length,
+    p50: q(0.5),
+    p95: q(0.95),
+  };
 }

@@ -23,6 +23,10 @@ Inspired by [Maria's request](https://x.com/maria_rcks/status/210586832185398497
 
 Switchyard is an independent implementation, not a full port of every CLIProxyAPI provider. See the [compatibility guide](docs/compatibility.md) for exact protocol behavior and limits.
 
+## Download
+
+[Download the latest release](https://github.com/RealSid08/switchyard/releases/latest) for Linux x86_64 or ARM64, macOS Apple Silicon, or Windows x86_64. Extract the archive and run `switchyard` (`switchyard.exe` on Windows). The control room is included; no Node or Rust installation is needed. Linux requires glibc 2.35 or newer. The macOS binary is unsigned and not notarized. Archives include SHA-256 checksums and GitHub build provenance.
+
 ## Run from source
 
 Requires the Rust toolchain pinned in `rust-toolchain.toml` (1.98.1), Node 24 and pnpm 12.
