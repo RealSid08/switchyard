@@ -364,7 +364,38 @@ async fn client_auth(State(app): State<App>, request: Request, next: Next) -> Re
     }
 }
 async fn security_headers(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
+    let inference =
+        request.uri().path().starts_with("/v1/") || request.uri().path().starts_with("/v1beta/");
+    let limit: u64 = if inference {
+        64 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
+    let oversized = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limit);
+    let http1 = matches!(
+        request.version(),
+        axum::http::Version::HTTP_10 | axum::http::Version::HTTP_11
+    );
+    let mut response = if oversized {
+        ApiError::new(
+            413,
+            "Request exceeds the size limit (64 MiB for inference, 8 MiB for administration)",
+        )
+        .into_response()
+    } else {
+        next.run(request).await
+    };
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE && http1 {
+        response.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+    }
     response.headers_mut().insert(
         "x-content-type-options",
         header::HeaderValue::from_static("nosniff"),
@@ -390,11 +421,13 @@ pub fn router(app: App) -> Router {
             put(update_connection).delete(delete_connection),
         )
         .route("/api/connections/{id}/test", post(test_connection))
+        .route("/api/connections/{id}/models", get(discover_models))
         .route("/api/import", post(import_credentials))
         .route("/api/models", get(models))
         .route("/api/routes", get(routes))
         .route("/api/routes/{*model}", put(save_route).delete(delete_route))
         .route("/api/requests", get(requests))
+        .route("/api/requests/{id}", get(request_detail))
         .route("/api/events", get(events))
         .route("/api/keys", get(keys).post(create_key))
         .route("/api/keys/{id}", delete(delete_key))
@@ -566,13 +599,25 @@ async fn settings(State(app): State<App>, Json(v): Json<Value>) -> Result<Json<V
     Ok(Json(overview))
 }
 async fn connections(State(app): State<App>) -> Json<Value> {
-    Json(json!(
-        app.store
-            .list::<Connection>("connection")
-            .iter()
-            .map(Connection::public)
-            .collect::<Vec<_>>()
-    ))
+    let records = app.store.requests(1000);
+    let connections: Vec<Connection> = app.store.list("connection");
+    let mut resilience = app.resilience.lock().expect("resilience lock");
+    let values: Vec<Value> = connections.iter().map(|connection| {
+        let mut value = connection.public();
+        let recent = records.iter().find(|record| record.connection_id == connection.id);
+        let cooldowns = resilience.cooldowns(&connection.id);
+        let account_cooling = cooldowns.iter().any(|(model,_)| model == "*");
+        value["health"] = json!({
+            "status":if !connection.enabled {"disabled"} else if account_cooling {"cooling"} else if !cooldowns.is_empty() {"limited"} else {"ready"},
+            "cooldowns":cooldowns.iter().map(|(model,seconds)| json!({"model":model,"retry_after_seconds":seconds})).collect::<Vec<_>>(),
+            "last_used_at":recent.map(|record| &record.timestamp),
+            "last_status":recent.map(|record| record.status),
+            "last_error":recent.and_then(|record| record.error.as_deref()),
+        });
+        value["credential_expires_at"] = if connection.expires_at > 0 {json!(connection.expires_at)} else {Value::Null};
+        value
+    }).collect();
+    Json(json!(values))
 }
 #[derive(Deserialize)]
 struct ConnectionInput {
@@ -721,7 +766,9 @@ async fn test_connection(
         .store
         .get::<Connection>("connection", &id)
         .ok_or(ApiError::new(404, "Connection not found"))?;
-    credentials::refresh(&app, &mut c).await?;
+    credentials::refresh(&app, &mut c)
+        .await
+        .map_err(management_error)?;
     let start = Instant::now();
     let path = if c.kind == "codex" {
         "models?client_version=0.159.3"
@@ -744,6 +791,280 @@ async fn test_connection(
     Ok(Json(
         json!({"ok":status<400,"status":status,"latency_ms":start.elapsed().as_millis(),"message":message}),
     ))
+}
+/// Bounds for one model catalog discovery (all pages together).
+const CATALOG_PAGES: usize = 5;
+const CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const CATALOG_MODELS: usize = 1000;
+const CATALOG_DEADLINE: Duration = Duration::from_secs(20);
+const CATALOG_UNAVAILABLE: &str =
+    "Provider model catalog unavailable. Check the account or enter model identifiers manually.";
+
+/// Remaining time before `deadline`, or a gateway timeout once it has passed.
+fn catalog_remaining(deadline: Instant) -> Result<Duration, ApiError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or(ApiError::new(
+            504,
+            "Provider model catalog timed out; enter model identifiers manually",
+        ))
+}
+/// The catalog URL for one page. Only the configured base URL is ever requested: cursors are
+/// sent as encoded query values, and URLs supplied by the provider are never followed.
+fn catalog_url(connection: &Connection, cursor: Option<&str>) -> Result<url::Url, ApiError> {
+    let mut url = url::Url::parse(&format!("{}/models", connection.base_url))
+        .map_err(|_| ApiError::bad("Invalid provider base URL"))?;
+    {
+        let mut q = url.query_pairs_mut();
+        match connection.kind.as_str() {
+            // Documented maximum page sizes: Anthropic `limit` 1..=1000, Gemini `pageSize` <=1000.
+            "anthropic" => {
+                q.append_pair("limit", "1000");
+                if let Some(c) = cursor {
+                    q.append_pair("after_id", c);
+                }
+            }
+            "gemini" => {
+                q.append_pair("pageSize", "1000");
+                if let Some(c) = cursor {
+                    q.append_pair("pageToken", c);
+                }
+            }
+            "codex" => {
+                q.append_pair("client_version", "0.160.0");
+            }
+            _ => {}
+        }
+    }
+    if url.query() == Some("") {
+        url.set_query(None);
+    }
+    Ok(url)
+}
+/// The cursor for the next page, if the provider says there is one. Only Anthropic and Gemini
+/// document catalog pagination.
+fn catalog_cursor(kind: &str, page: &Value) -> Option<String> {
+    let cursor = match kind {
+        "anthropic" if page["has_more"] == true => page["last_id"].as_str(),
+        "gemini" => page["nextPageToken"].as_str(),
+        _ => None,
+    }?;
+    (!cursor.is_empty() && cursor.len() <= 1024 && !cursor.chars().any(char::is_control))
+        .then(|| cursor.to_owned())
+}
+/// Reads one page within the remaining byte budget and deadline. Errors carry a status for the
+/// first page; later pages only end pagination early.
+async fn catalog_page(
+    app: &App,
+    connection: &mut Connection,
+    cursor: Option<&str>,
+    deadline: Instant,
+    budget: usize,
+    adopted: &mut bool,
+) -> Result<Vec<u8>, ApiError> {
+    let url = catalog_url(connection, cursor)?;
+    let send = |connection: &Connection, remaining: Duration| {
+        proxy::upstream_headers(app.client.get(url.clone()), connection)
+            .timeout(remaining)
+            .send()
+    };
+    let unreachable = || ApiError::upstream("Could not reach the provider's model catalog");
+    let mut response = send(connection, catalog_remaining(deadline)?)
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                ApiError::new(504, "Provider model catalog timed out; enter model identifiers manually")
+            } else {
+                unreachable()
+            }
+        })?;
+    // One credential renewal or source adoption per discovery, inside the same deadline.
+    if response.status() == StatusCode::UNAUTHORIZED && !*adopted {
+        *adopted = true;
+        let rejected = connection.api_key.clone();
+        let renewed = tokio::time::timeout(
+            catalog_remaining(deadline)?,
+            credentials::refresh_forced(app, connection),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok());
+        if renewed && connection.api_key != rejected {
+            response = send(connection, catalog_remaining(deadline)?)
+                .await
+                .map_err(|_| unreachable())?;
+        }
+    }
+    let status = response.status();
+    if !status.is_success() {
+        let code = match status.as_u16() {
+            401 | 403 => 424,
+            code @ 400..=599 => code,
+            _ => 502,
+        };
+        return Err(ApiError::new(code, CATALOG_UNAVAILABLE));
+    }
+    let too_large = || ApiError::upstream("Provider model catalog exceeds 2 MiB");
+    if response.content_length().is_some_and(|n| n as usize > budget) {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(catalog_remaining(deadline)?, response.chunk())
+            .await
+            .map_err(|_| catalog_remaining(deadline).err().unwrap_or_else(unreachable))?
+            .map_err(|_| ApiError::upstream("Provider model catalog interrupted"))?;
+        let Some(chunk) = chunk else { break };
+        if bytes.len() + chunk.len() > budget {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+/// A catalog entry's identifier and display name, if the identifier is usable.
+fn catalog_entry(model: &Value) -> Option<(String, String)> {
+    let raw = model["id"]
+        .as_str()
+        .or(model["slug"].as_str())
+        .or(model["name"].as_str())?;
+    let id = raw.strip_prefix("models/").unwrap_or(raw);
+    if id.is_empty() || id.len() > 200 || id.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let name = model["display_name"]
+        .as_str()
+        .or(model["displayName"].as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.len() <= 200 && !n.chars().any(char::is_control))
+        .unwrap_or(id);
+    Some((id.to_owned(), name.to_owned()))
+}
+/// Lists the provider's own model catalog for a connection, following documented pagination
+/// within fixed bounds. Never changes the connection's configured models.
+async fn discover_models(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let deadline = Instant::now() + CATALOG_DEADLINE.min(app.timeout);
+    let mut connection = app
+        .store
+        .get::<Connection>("connection", &id)
+        .ok_or(ApiError::new(404, "Connection not found"))?;
+    tokio::time::timeout(
+        catalog_remaining(deadline)?,
+        credentials::refresh(&app, &mut connection),
+    )
+    .await
+    .map_err(|_| catalog_remaining(deadline).err().unwrap_or(ApiError::new(504, CATALOG_UNAVAILABLE)))?
+    .map_err(management_error)?;
+
+    let mut models = std::collections::BTreeMap::<String, String>::new();
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    let mut used = 0usize;
+    let mut adopted = false;
+    let mut truncated: Option<&str> = None;
+    for page_index in 0..CATALOG_PAGES {
+        let bytes = match catalog_page(
+            &app,
+            &mut connection,
+            cursor.as_deref(),
+            deadline,
+            CATALOG_BYTES - used,
+            &mut adopted,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) if page_index == 0 => return Err(e),
+            Err(_) => {
+                truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+                break;
+            }
+        };
+        used += bytes.len();
+        let page: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) if page_index == 0 => {
+                return Err(ApiError::upstream("Invalid provider model catalog"));
+            }
+            Err(_) => {
+                truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+                break;
+            }
+        };
+        let Some(entries) = page["data"].as_array().or_else(|| page["models"].as_array()) else {
+            if page_index == 0 {
+                return Err(ApiError::upstream(
+                    "Unsupported provider model catalog; enter model identifiers manually",
+                ));
+            }
+            truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+            break;
+        };
+        for (id, name) in entries.iter().filter_map(catalog_entry) {
+            if models.len() >= CATALOG_MODELS && !models.contains_key(&id) {
+                truncated = Some("Showing the first 1,000 models from the provider's catalog.");
+                break;
+            }
+            models.insert(id, name);
+        }
+        if truncated.is_some() {
+            break;
+        }
+        let next = catalog_cursor(&connection.kind, &page);
+        match next {
+            None => {
+                // OpenAI-style lists may report more results without a documented cursor.
+                if page["has_more"] == true && connection.kind != "anthropic" {
+                    truncated = Some("The provider reported more models than it returned. Add any missing models manually.");
+                } else if page["has_more"] == true || page["nextPageToken"].is_string() {
+                    truncated = Some("The provider's catalog could only be read in part. Add any missing models manually.");
+                }
+                break;
+            }
+            Some(next) => {
+                if !seen_cursors.insert(next.clone()) {
+                    truncated = Some("The provider repeated a catalog page; showing the models read so far.");
+                    break;
+                }
+                if page_index + 1 == CATALOG_PAGES {
+                    truncated = Some("The provider's catalog has more pages than Switchyard reads. Add any missing models manually.");
+                    break;
+                }
+                if catalog_remaining(deadline).is_err() {
+                    truncated = Some("The provider's catalog took too long to read in full. Add any missing models manually.");
+                    break;
+                }
+                cursor = Some(next);
+            }
+        }
+    }
+    let mut body = json!({
+        "connection_id": connection.id,
+        "models": models.into_iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>(),
+    });
+    if let Some(message) = truncated {
+        body["truncated"] = json!(true);
+        body["message"] = json!(message);
+    }
+    Ok(Json(body))
+}
+async fn request_detail(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let record = app
+        .store
+        .requests(1000)
+        .into_iter()
+        .find(|record| record.id == id)
+        .ok_or(ApiError::new(
+            404,
+            "Request no longer retained in activity history",
+        ))?;
+    Ok(Json(json!(record)))
 }
 async fn import_credentials(
     State(app): State<App>,
@@ -907,7 +1228,26 @@ async fn playground(State(app): State<App>, Json(v): Json<Value>) -> Result<Resp
             json!({"model":model,"input":input,"stream":stream}),
         ),
     };
-    proxy::execute(app, endpoint, body, HeaderMap::new()).await
+    let mut response = proxy::execute(app, endpoint, body, HeaderMap::new())
+        .await
+        .map_err(management_error)?;
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        *response.status_mut() = StatusCode::FAILED_DEPENDENCY;
+    }
+    Ok(response)
+}
+// Provider authentication is a dependency failure, distinct from the dashboard's own session.
+fn management_error(mut error: ApiError) -> ApiError {
+    if matches!(
+        error.status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ) {
+        error.status = StatusCode::FAILED_DEPENDENCY;
+    }
+    error
 }
 #[derive(rust_embed::RustEmbed)]
 #[folder = "ui/dist/"]

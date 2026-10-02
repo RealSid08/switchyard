@@ -9,7 +9,7 @@
 use crate::{
     app::{ApiError, App},
     credentials,
-    store::{Connection, RequestRecord, Route, id, now},
+    store::{Connection, MAX_ATTEMPTS, RequestAttempt, RequestRecord, Route, id, now},
 };
 use axum::{
     Json,
@@ -254,13 +254,103 @@ fn anthropic_betas(h: &HeaderMap, oauth: bool) -> Option<HeaderValue> {
 // Request records
 // ---------------------------------------------------------------------------------------------
 
+/// Constant labels for `RequestAttempt::error`. Attempts never carry provider-supplied text.
+mod attempt_error {
+    /// The account's credential could not be made usable; nothing was sent.
+    pub const CREDENTIAL_UNAVAILABLE: &str = "credential_unavailable";
+    /// The connection was never established; safe to try another account.
+    pub const CONNECT_FAILED: &str = "connect_failed";
+    /// The request was sent but the transport failed or timed out before a response.
+    pub const TRANSPORT_FAILED: &str = "transport_failed";
+    /// 401/403: credential rejected or account not permitted.
+    pub const AUTH_REJECTED: &str = "auth_rejected";
+    /// 429: account or model rate limited.
+    pub const RATE_LIMITED: &str = "rate_limited";
+    /// 5xx: provider unavailable.
+    pub const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
+    /// Any other non-2xx status.
+    pub const REQUEST_REJECTED: &str = "request_rejected";
+}
+
+/// The constant attempt label for an upstream HTTP status, `None` for success.
+fn status_label(status: u16) -> Option<&'static str> {
+    match status {
+        100..=399 => None,
+        401 | 403 => Some(attempt_error::AUTH_REJECTED),
+        429 => Some(attempt_error::RATE_LIMITED),
+        500..=599 => Some(attempt_error::PROVIDER_UNAVAILABLE),
+        _ => Some(attempt_error::REQUEST_REJECTED),
+    }
+}
+
+fn non_empty(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| !s.is_empty())
+}
+
+/// True for the first kinds of semantic output a client can show: text, refusals, tool-call
+/// arguments and reasoning/thinking, in every native stream format the gateway relays.
+fn is_output_delta(e: &Value) -> bool {
+    match e["type"].as_str().unwrap_or("") {
+        "response.output_text.delta"
+        | "response.refusal.delta"
+        | "response.function_call_arguments.delta"
+        | "response.custom_tool_call_input.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta" => return non_empty(&e["delta"]),
+        "content_block_delta" => {
+            let d = &e["delta"];
+            return non_empty(&d["text"])
+                || non_empty(&d["partial_json"])
+                || non_empty(&d["thinking"]);
+        }
+        _ => {}
+    }
+    let chat = e["choices"].as_array().is_some_and(|choices| {
+        choices.iter().any(|c| {
+            let d = &c["delta"];
+            non_empty(&d["content"])
+                || non_empty(&d["refusal"])
+                || non_empty(&d["reasoning_content"])
+                || d["tool_calls"].as_array().is_some_and(|t| !t.is_empty())
+        })
+    });
+    let gemini = e["candidates"].as_array().is_some_and(|candidates| {
+        candidates.iter().any(|c| {
+            c["content"]["parts"].as_array().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|p| non_empty(&p["text"]) || p["functionCall"].is_object())
+            })
+        })
+    });
+    chat || gemini
+}
+
+fn ms_since(t: Instant) -> u64 {
+    t.elapsed().as_millis() as u64
+}
+
+/// The requested model when it names a stored route.
+fn route_alias(app: &App, model: &str) -> Option<String> {
+    app.store
+        .get::<Route>("route", model)
+        .map(|_| model.to_string())
+}
+
 /// One request-log row, written when dropped. Until `finish` is called the row reads as a client
 /// disconnect (499), which is exactly what happens if the response future is dropped early.
+///
+/// It also carries the observability trace: every upstream attempt, failovers between accounts,
+/// time to first upstream byte and time to first output delta (see `RequestRecord`).
 struct RecordGuard {
     app: App,
     record: Option<RequestRecord>,
     start: Instant,
     settled: bool,
+    /// Connection of the previous attempt, to count moves between accounts.
+    last_connection: Option<String>,
+    /// Timings are only captured while open; a WebSocket session closes them after its first turn.
+    timing_open: bool,
     _permit: OwnedSemaphorePermit,
 }
 impl RecordGuard {
@@ -269,6 +359,7 @@ impl RecordGuard {
         c: &Connection,
         model: &str,
         transport: &str,
+        route: Option<String>,
         permit: OwnedSemaphorePermit,
     ) -> Self {
         app.active.fetch_add(1, Ordering::Relaxed);
@@ -286,11 +377,80 @@ impl RecordGuard {
                 input_tokens: None,
                 output_tokens: None,
                 error: Some("Client disconnected before completion".into()),
+                route,
+                failovers: 0,
+                attempts: Vec::new(),
+                ttfb_ms: None,
+                first_token_ms: None,
             }),
             start: Instant::now(),
             settled: false,
+            last_connection: None,
+            timing_open: true,
             _permit: permit,
         }
+    }
+    /// Records one upstream attempt. `error` must be a constant label from `attempt_error`.
+    fn attempt(
+        &mut self,
+        c: &Connection,
+        model: &str,
+        status: u16,
+        duration_ms: u64,
+        error: Option<&'static str>,
+    ) {
+        let moved = self
+            .last_connection
+            .as_ref()
+            .is_some_and(|previous| *previous != c.id);
+        self.last_connection = Some(c.id.clone());
+        let Some(r) = &mut self.record else { return };
+        if moved {
+            r.failovers += 1;
+        }
+        if r.attempts.len() < MAX_ATTEMPTS {
+            r.attempts.push(RequestAttempt {
+                connection_id: c.id.clone(),
+                connection_name: c.name.clone(),
+                model: model.into(),
+                status,
+                duration_ms,
+                error: error.map(String::from),
+            });
+        }
+    }
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+    /// The first body byte (or WebSocket frame) of the successful upstream response arrived.
+    fn first_byte(&mut self) {
+        let ms = self.elapsed_ms();
+        if let Some(r) = &mut self.record
+            && self.timing_open
+            && r.ttfb_ms.is_none()
+        {
+            r.ttfb_ms = Some(ms);
+        }
+    }
+    /// Notes the first non-empty output delta in `event`, if this is one.
+    fn observe_output(&mut self, event: &Value) {
+        if !self.timing_open
+            || self
+                .record
+                .as_ref()
+                .is_none_or(|r| r.first_token_ms.is_some())
+            || !is_output_delta(event)
+        {
+            return;
+        }
+        let ms = self.elapsed_ms();
+        if let Some(r) = &mut self.record {
+            r.first_token_ms = Some(ms);
+        }
+    }
+    /// Stops timing capture (end of the first WebSocket turn).
+    fn close_timing(&mut self) {
+        self.timing_open = false;
     }
     fn attribute(&mut self, c: &Connection) {
         if let Some(r) = &mut self.record {
@@ -624,18 +784,30 @@ impl Redactor {
                 }
             }
         }
-        // Short values would redact ordinary words; longest first so prefixes do not leak tails.
-        secrets.retain(|s| s.len() >= 6);
+        // Every known credential is kept, however short; longest first so prefixes cannot leak
+        // tails. Short values are matched as whole tokens in `text` to avoid mangling words.
+        for s in &mut secrets {
+            *s = s.trim().to_string();
+        }
+        secrets.retain(|s| !s.is_empty());
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         secrets.dedup();
         Self { secrets }
     }
     fn text(&self, s: &str) -> String {
+        if self.secrets.iter().any(|secret| s.trim() == secret) {
+            return "[redacted]".into();
+        }
         let mut out = s.to_string();
         for secret in &self.secrets {
-            if out.contains(secret.as_str()) {
-                out = out.replace(secret.as_str(), "[redacted]");
+            if !out.contains(secret.as_str()) {
+                continue;
             }
+            out = if secret.len() >= 6 {
+                out.replace(secret.as_str(), "[redacted]")
+            } else {
+                replace_whole_token(&out, secret)
+            };
         }
         redact_token_shapes(&out)
     }
@@ -650,6 +822,27 @@ impl Redactor {
             other => other.clone(),
         }
     }
+}
+
+/// Replaces `needle` where it stands alone as a token (not inside a longer word).
+fn replace_whole_token(haystack: &str, needle: &str) -> String {
+    let token_char = |c: char| c.is_ascii_alphanumeric() || "-_.~+/=".contains(c);
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0;
+    for (at, _) in haystack.match_indices(needle) {
+        if at < last {
+            continue;
+        }
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + needle.len()..].chars().next();
+        if before.is_none_or(|c| !token_char(c)) && after.is_none_or(|c| !token_char(c)) {
+            out.push_str(&haystack[last..at]);
+            out.push_str("[redacted]");
+            last = at + needle.len();
+        }
+    }
+    out.push_str(&haystack[last..]);
+    out
 }
 
 /// Redacts anything shaped like a provider or gateway credential, even when it is not one of the
@@ -740,14 +933,16 @@ fn anthropic_error_type(status: u16) -> &'static str {
 }
 
 /// A short, log-safe label for a provider error: the native code or type when it is a plain
-/// identifier, never free text.
-fn error_label(body: &Value) -> String {
+/// identifier, never free text. The code is checked against every known credential first, so a
+/// provider that echoes a key, token or account ID as its "code" cannot get it into the log.
+fn error_label(body: &Value, redactor: &Redactor) -> String {
     let error = body.get("error").unwrap_or(body);
     let code = error["code"]
         .as_str()
         .or(error["type"].as_str())
         .unwrap_or("");
     let safe = !code.is_empty()
+        && redactor.text(code) == code
         && code.len() <= 64
         && code
             .chars()
@@ -1031,7 +1226,10 @@ fn relay_stream(
         loop {
             let bytes = match upstream.next().await {
                 None => break,
-                Some(Ok(bytes)) => bytes,
+                Some(Ok(bytes)) => {
+                    guard.first_byte();
+                    bytes
+                }
                 Some(Err(_)) => {
                     // After a terminal event the response is complete; a dropped connection is
                     // not a failure. Before it, output is partial and must not be replayed.
@@ -1052,6 +1250,7 @@ fn relay_stream(
             };
             for e in &events {
                 guard.usage(e);
+                guard.observe_output(e);
                 if outcome.is_some() {
                     continue;
                 }
@@ -1065,7 +1264,8 @@ fn relay_stream(
                         }
                     }
                     Terminal::Failure => {
-                        guard.finish(502, Some(&format!("{} in stream", error_label(e))));
+                        let label = error_label(e, &redactor);
+                        guard.finish(502, Some(&format!("{label} in stream")));
                     }
                 }
             }
@@ -1146,15 +1346,18 @@ pub async fn count_tokens(
             continue;
         }
         let plan = plan_request(ENDPOINT, &body, &c, &target_model, false);
-        let res = match send_with_auth_retry(&app, &mut c, &plan, &h, false).await {
-            Ok(res) => res,
-            Err(e) if e.is_connect() && !last => continue,
-            Err(_) => {
-                return Err(ApiError::upstream(
-                    "Provider connection failed or timed out",
-                ));
-            }
-        };
+        let res =
+            match send_with_auth_retry(&app, &mut c, &plan, &h, false, None, &mut Instant::now())
+                .await
+            {
+                Ok(res) => res,
+                Err(e) if e.is_connect() && !last => continue,
+                Err(_) => {
+                    return Err(ApiError::upstream(
+                        "Provider connection failed or timed out",
+                    ));
+                }
+            };
         let status = res.status();
         let headers = res.headers().clone();
         let value = read_json_bounded(res).await;
@@ -1264,21 +1467,39 @@ fn build_request(
 /// Sends the request. After a 401 for a subscription account, adopts or refreshes the credential
 /// once and resends to the same account only if the token actually changed: a 401 means the
 /// provider did not run the request, so this is not a replay of inference.
+///
+/// `started` is the start of the current attempt; when a retry happens the rejected send is
+/// recorded on `trace` and `started` moves to the retry (which includes the forced refresh).
 async fn send_with_auth_retry(
     app: &App,
     c: &mut Connection,
     plan: &Plan,
     h: &HeaderMap,
     stream: bool,
+    trace: Option<&mut RecordGuard>,
+    started: &mut Instant,
 ) -> reqwest::Result<reqwest::Response> {
     let res = build_request(app, c, plan, h, stream).send().await?;
     if res.status() != StatusCode::UNAUTHORIZED || !c.oauth {
         return Ok(res);
     }
     let rejected = c.api_key.clone();
+    let rejected_ms = ms_since(*started);
+    let retry_started = Instant::now();
     match credentials::refresh_forced(app, c).await {
         Ok(()) if c.api_key != rejected => {
+            if let Some(guard) = trace {
+                let model = plan.payload["model"].as_str().unwrap_or("");
+                guard.attempt(
+                    c,
+                    model,
+                    401,
+                    rejected_ms,
+                    Some(attempt_error::AUTH_REJECTED),
+                );
+            }
             drop(res);
+            *started = retry_started;
             build_request(app, c, plan, h, stream).send().await
         }
         _ => Ok(res),
@@ -1312,6 +1533,7 @@ async fn collect(
             guard.finish(502, Some("Upstream response interrupted"));
             ApiError::upstream("Upstream response interrupted")
         })?;
+        guard.first_byte();
         if !sse {
             bytes.extend_from_slice(&b);
             if bytes.len() > MAX_COLLECTED {
@@ -1325,6 +1547,7 @@ async fn collect(
         })?;
         for v in events {
             guard.usage(&v);
+            guard.observe_output(&v);
             match v["type"].as_str().unwrap_or("") {
                 "response.output_item.done" if v["item"].is_object() => {
                     match v["output_index"].as_u64() {
@@ -1343,7 +1566,8 @@ async fn collect(
                     } else {
                         v.clone()
                     };
-                    guard.finish(502, Some(&format!("{} in stream", error_label(&error))));
+                    let label = error_label(&error, redactor);
+                    guard.finish(502, Some(&format!("{label} in stream")));
                     let response =
                         provider_error(StatusCode::BAD_GATEWAY, &error, redactor, endpoint);
                     return Ok(Collected::Failed(response));
@@ -1392,12 +1616,23 @@ pub async fn execute(
     }
     let permit = permit(&app)?;
     let transport = if wants_stream { "sse" } else { "http" };
-    let mut guard = RecordGuard::new(app.clone(), &candidates[0].0, &model, transport, permit);
+    let route = route_alias(&app, &model);
+    let mut guard = RecordGuard::new(
+        app.clone(),
+        &candidates[0].0,
+        &model,
+        transport,
+        route,
+        permit,
+    );
     let count = candidates.len();
     for (i, (mut c, target_model)) in candidates.into_iter().enumerate() {
         let last = i + 1 == count;
+        let mut started = Instant::now();
         guard.attribute(&c);
         if let Err(e) = credentials::refresh(&app, &mut c).await {
+            let unavailable = Some(attempt_error::CREDENTIAL_UNAVAILABLE);
+            guard.attempt(&c, &target_model, 0, ms_since(started), unavailable);
             guard.finish(e.status.as_u16(), Some("Credential refresh failed"));
             if !last {
                 cool_account(&app, &c.id, 30);
@@ -1406,10 +1641,26 @@ pub async fn execute(
             return Err(e);
         }
         let plan = plan_request(endpoint, &body, &c, &target_model, wants_stream);
-        let res = match send_with_auth_retry(&app, &mut c, &plan, &h, wants_stream).await {
+        let sent = send_with_auth_retry(
+            &app,
+            &mut c,
+            &plan,
+            &h,
+            wants_stream,
+            Some(&mut guard),
+            &mut started,
+        )
+        .await;
+        let res = match sent {
             Ok(res) => res,
             Err(e) => {
                 let never_connected = e.is_connect();
+                let label = if never_connected {
+                    attempt_error::CONNECT_FAILED
+                } else {
+                    attempt_error::TRANSPORT_FAILED
+                };
+                guard.attempt(&c, &target_model, 0, ms_since(started), Some(label));
                 tracing::warn!(error = %e.without_url(), "Upstream HTTP connection failed");
                 // Only a connection that was never established is safe to send elsewhere.
                 if never_connected && !last {
@@ -1423,6 +1674,13 @@ pub async fn execute(
             }
         };
         let status = res.status();
+        guard.attempt(
+            &c,
+            &target_model,
+            status.as_u16(),
+            ms_since(started),
+            status_label(status.as_u16()),
+        );
         let redactor = Redactor::new(&c, &h);
         if !status.is_success() {
             let headers = res.headers().clone();
@@ -1435,7 +1693,7 @@ pub async fn execute(
                     continue;
                 }
             }
-            guard.finish(code, Some(&error_label(&error_body)));
+            guard.finish(code, Some(&error_label(&error_body, &redactor)));
             let mut response = provider_error(status, &error_body, &redactor, endpoint);
             if let Some(v) = headers.get("retry-after") {
                 response.headers_mut().insert("retry-after", v.clone());
@@ -1639,8 +1897,11 @@ async fn connect_upstream(
     guard: &mut RecordGuard,
 ) -> Option<(Connection, String, Upstream)> {
     for (mut c, target) in candidates {
+        let mut started = Instant::now();
         guard.attribute(&c);
         if credentials::refresh(app, &mut c).await.is_err() {
+            let unavailable = Some(attempt_error::CREDENTIAL_UNAVAILABLE);
+            guard.attempt(&c, &target, 0, ms_since(started), unavailable);
             cool_account(app, &c.id, 30);
             continue;
         }
@@ -1649,16 +1910,29 @@ async fn connect_upstream(
             && c.oauth
         {
             let rejected = c.api_key.clone();
+            let rejected_ms = ms_since(started);
+            let retry_started = Instant::now();
             if credentials::refresh_forced(app, &mut c).await.is_ok() && c.api_key != rejected {
+                let auth = Some(attempt_error::AUTH_REJECTED);
+                guard.attempt(&c, &target, 401, rejected_ms, auth);
+                started = retry_started;
                 result = ws_handshake(&c, h).await;
             }
         }
         match result {
-            Ok(upstream) => return Some((c, target, upstream)),
+            Ok(upstream) => {
+                guard.attempt(&c, &target, 101, ms_since(started), None);
+                return Some((c, target, upstream));
+            }
             Err(Handshake::Rejected { status, retry }) => {
+                guard.attempt(&c, &target, status, ms_since(started), status_label(status));
                 cool_for_status(app, &c.id, &target, status, retry);
             }
-            Err(Handshake::Unreachable) => cool_model(app, &c.id, &target, 10),
+            Err(Handshake::Unreachable) => {
+                let failed = Some(attempt_error::CONNECT_FAILED);
+                guard.attempt(&c, &target, 0, ms_since(started), failed);
+                cool_model(app, &c.id, &target, 10);
+            }
         }
     }
     None
@@ -1736,7 +2010,8 @@ async fn bridge(
     if let Err(message) = apply_affinity(&app, previous, &mut cs) {
         return ws_error(&mut socket, message).await;
     }
-    let mut guard = RecordGuard::new(app.clone(), &cs[0].0, &model, "websocket", permit);
+    let route = route_alias(&app, &model);
+    let mut guard = RecordGuard::new(app.clone(), &cs[0].0, &model, "websocket", route, permit);
     let Some((c, target, mut upstream)) = connect_upstream(&app, &h, cs, &mut guard).await else {
         guard.finish(502, Some("All upstream WebSocket handshakes failed"));
         return ws_error(
@@ -1758,7 +2033,24 @@ async fn bridge(
         )
         .await;
     }
-    relay_ws(app, guard, socket, upstream, c, target, model).await;
+    let redactor = Redactor::new(&c, &h);
+    let pinned = Pinned {
+        c,
+        target,
+        model,
+        redactor,
+    };
+    relay_ws(app, guard, socket, upstream, pinned).await;
+}
+
+/// What a WebSocket session is pinned to for its whole life.
+struct Pinned {
+    c: Connection,
+    /// Upstream model name.
+    target: String,
+    /// Model name the client opened the session with.
+    model: String,
+    redactor: Redactor,
 }
 
 /// Relays one session. A single upstream socket serves the whole session: frames are never
@@ -1769,10 +2061,14 @@ async fn relay_ws(
     mut guard: RecordGuard,
     socket: WebSocket,
     upstream: Upstream,
-    c: Connection,
-    target: String,
-    model: String,
+    pinned: Pinned,
 ) {
+    let Pinned {
+        c,
+        target,
+        model,
+        redactor,
+    } = pinned;
     let (mut client_tx, mut client_rx) = socket.split();
     let (mut up_tx, mut up_rx) = upstream.split();
     let idle = tokio::time::sleep(app.timeout);
@@ -1841,8 +2137,13 @@ async fn relay_ws(
             incoming = up_rx.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
                     idle.as_mut().reset(tokio::time::Instant::now() + app.timeout);
+                    guard.first_byte();
                     if let Ok(v) = serde_json::from_str::<Value>(&text) {
                         guard.usage(&v);
+                        guard.observe_output(&v);
+                        if terminal_event(&v).is_some() {
+                            guard.close_timing(); // record timings describe the first turn
+                        }
                         match v["type"].as_str().unwrap_or("") {
                             "response.completed" | "response.incomplete" => {
                                 active = false;
@@ -1853,7 +2154,8 @@ async fn relay_ws(
                             }
                             "response.failed" | "error" => {
                                 active = false;
-                                guard.finish(502, Some(&format!("{} on WebSocket", error_label(&v))));
+                                let label = error_label(&v, &redactor);
+                                guard.finish(502, Some(&format!("{label} on WebSocket")));
                                 if let Some((status, retry)) = ws_error_cooldown(&v) {
                                     cool_for_status(&app, &c.id, &target, status, retry);
                                 }

@@ -800,27 +800,38 @@ async fn route_errors_are_reported_clearly() {
         .await
         .unwrap();
     assert!(r.status().is_client_error());
-    let r = gw
-        .http
-        .post(gw.url("/v1/responses"))
-        .bearer_auth(&key)
-        .header("content-type", "application/json")
-        .body(vec![b' '; 65 * 1024 * 1024])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 413, "inference bodies are capped at 64 MiB");
-    // Admin endpoints keep the tighter 8 MiB cap.
-    let r = gw
-        .http
-        .post(gw.url("/api/keys"))
-        .bearer_auth(&gw.admin)
-        .header("content-type", "application/json")
-        .body(vec![b' '; 9 * 1024 * 1024])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 413);
+    // Verify rejection before upload. Sending 65 MiB while the server rejects the headers can
+    // produce a Winsock reset in reqwest, obscuring the valid 413 response on Windows.
+    async fn oversized_status(gw: &Gateway, path: &str, token: &str, length: usize) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+            .await
+            .unwrap();
+        socket.write_all(format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n", gw.port).as_bytes()).await.unwrap();
+        let mut bytes = [0u8; 512];
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        std::str::from_utf8(&bytes[..count])
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    assert_eq!(
+        oversized_status(&gw, "/v1/responses", &key, 65 * 1024 * 1024).await,
+        413,
+        "inference bodies are capped at 64 MiB before upload"
+    );
+    assert_eq!(
+        oversized_status(&gw, "/api/keys", &gw.admin, 9 * 1024 * 1024).await,
+        413,
+        "admin bodies are capped at 8 MiB before upload"
+    );
 }
 
 #[tokio::test]

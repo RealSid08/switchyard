@@ -9,7 +9,6 @@ use axum::{
     response::Response,
     routing::post,
 };
-use reqwest::Method;
 use serde_json::{Value, json};
 use support::*;
 
@@ -787,15 +786,28 @@ async fn inference_bodies_between_8_and_64_mib_are_proxied() {
         .await;
     assert_eq!(r.status(), 200);
     assert_eq!(r.json::<Value>().await.unwrap()["received"], input.len());
-    // Admin surface keeps the 8 MiB cap.
-    let r = gw
-        .admin_send(
-            Method::POST,
-            "/api/playground",
-            json!({"model":"m","input":input}),
-        )
-        .await;
-    assert_eq!(r.status(), 413);
+    // Unknown-length bodies still enforce the admin cap without relying on Content-Length.
+    // Run through the same router in process to avoid an OS reset racing a rejected upload.
+    use tower::ServiceExt;
+    let chunks = futures_util::stream::iter(
+        (0..9).map(|_| Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![b' '; 1024 * 1024]))),
+    );
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/playground")
+        .header("authorization", format!("Bearer {}", gw.admin))
+        .header("content-type", "application/json")
+        .body(Body::from_stream(chunks))
+        .unwrap();
+    let response = switchyard::app::router(gw.app.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        413,
+        "streamed bodies cannot bypass the admin cap"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

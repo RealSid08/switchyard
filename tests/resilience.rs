@@ -1125,6 +1125,11 @@ async fn request_history_keeps_last_1000_while_counters_are_lifetime() {
             input_tokens: None,
             output_tokens: None,
             error: None,
+            route: None,
+            failovers: 0,
+            attempts: Vec::new(),
+            ttfb_ms: None,
+            first_token_ms: None,
         };
         gw.app.store.record(&r).unwrap();
     }

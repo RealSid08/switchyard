@@ -15,6 +15,8 @@ Switchyard forwards each provider's native protocol. The one translation it perf
 
 Clients authenticate with `Authorization: Bearer <key>`, `x-api-key: <key>` (Anthropic SDKs) or `x-goog-api-key: <key>` (Google SDKs). The client's key is never sent upstream; Switchyard authenticates with the connection's own credential.
 
+`POST /v1/messages/count_tokens` forwards Anthropic's token counting to `{base}/messages/count_tokens` with the same account selection, failover and redaction as Messages. It is not recorded in request history and does not create cooldowns.
+
 A request for a model that only exists on an incompatible connection kind returns 400 and names the right endpoint. Mixed-kind routes use only the targets compatible with the endpoint called.
 
 ## Requests
@@ -60,7 +62,7 @@ Chat Completions on `openai` connections is passed through: streams byte for byt
 
 ## Multiple accounts
 
-- Before any output, a refused connection, 401, 403, 429, 502, 503, 504 or failed token renewal moves the request to the next account and cools the failed one. An uncertain failure after the request was sent (such as a timeout) is returned, not replayed.
+- Before any output, a refused connection, 401, 403, 429, 502, 503, 504 or failed token renewal moves the request to the next account and cools the failed one. For OAuth-based accounts a 401 first gets one token renewal (or adoption of a newer imported token) and one retry on the same account. An uncertain failure after the request was sent (such as a timeout) is returned, not replayed.
 - Conversations stay on their account. Responses ids from completed responses (HTTP, SSE and WebSocket) are remembered for one hour (4,096 most recent), including across restarts. A follow-up whose account is unavailable, or an unknown id in a multi-account pool, returns 409 rather than guessing.
 - WebSocket handshakes fail over between accounts before the first inference frame. After that, a session never changes account.
 
@@ -70,11 +72,20 @@ The first frame must be `response.create`, with fields either top-level or neste
 
 ## Accounts and models
 
-Imported and signed-in accounts start with a suggested model list (for Codex, based on the plan in the token). These are editable starting points, not an availability guarantee; edit them to match what your account can use. Connection tests call the provider's model list; the playground verifies real inference.
+Imported and signed-in accounts start with a suggested model list (for Codex, based on the plan in the token). These are editable starting points, not an availability guarantee. To see what an account actually offers, list the provider's catalog (`GET /api/connections/{id}/models`) and save the identifiers you want; listing never changes the configured models by itself.
+
+| Connection kind | Catalog request | Identifier | Display name |
+| --- | --- | --- | --- |
+| `openai` | `GET {base}/models` | `data[].id` | `id` |
+| `anthropic` | `GET {base}/models` | `data[].id` | `display_name` |
+| `codex` | `GET {base}/models?client_version=...` | `models[].slug` | `display_name` |
+| `gemini` | `GET {base}/models` | `models[].name` without `models/` | `displayName` |
+
+Only the first page of a catalog is read. Anthropic and Gemini page their catalogs, so long catalogs can be incomplete; add missing identifiers by hand. Connection tests check that the provider's model endpoint answers; the playground verifies real inference.
 
 ## Not implemented
 
 - Gemini CLI OAuth, Vertex AI, Antigravity, Grok, Qwen and other CLIProxyAPI providers.
 - Translation between providers (for example Anthropic Messages to OpenAI), except Chat Completions on Codex.
-- Automatic discovery of every model an account can use.
+- Automatic model discovery: catalogs are listed on request and never applied automatically, and only their first page is read.
 - Full CLIProxyAPI parity in general.

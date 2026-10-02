@@ -80,6 +80,22 @@ impl Resilience {
             .map(|t| t.saturating_duration_since(Instant::now()).as_secs() + 1)
             .unwrap_or(0)
     }
+    pub fn cooldowns(&mut self, connection: &str) -> Vec<(String, u64)> {
+        self.prune();
+        let mut entries: Vec<_> = self
+            .cooling
+            .iter()
+            .filter(|((account, _), _)| account == connection)
+            .map(|((_, model), expiry)| {
+                (
+                    model.clone(),
+                    expiry.saturating_duration_since(Instant::now()).as_secs() + 1,
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
     pub fn remember(&mut self, response: &str, connection: &str) {
         self.prune();
         if self.affinity.len() >= 4096

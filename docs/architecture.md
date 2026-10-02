@@ -1,13 +1,13 @@
 # Architecture
 
-Switchyard is one Rust binary. It serves the management API, the inference gateway and the React control room (embedded with rust-embed from `ui/dist`). State lives in a private data directory: an `admin-token` file, a SQLite database in WAL mode, and a `switchyard.lock` file. The lock is held for the life of the process, so a second Switchyard process (including `switchyard import` and `switchyard token-path`) cannot use the same directory at the same time.
+Switchyard is one Rust binary. It serves the management API, the inference gateway and the React control room (embedded with rust-embed from `ui/dist`). State lives in a private data directory: an `admin-token` file, a SQLite database in WAL mode, a `switchyard.lock` file and, while the server runs, a private `runtime.json` with its listening address. The lock is taken before any state is touched and held for the life of the process, so a second server on the same directory exits without changing anything. `switchyard token-path` only prints a path and takes no lock. `switchyard import` checks the lock first: if a server holds it, the CLI sends the import to that server's admin API at the address in `runtime.json` (the `--port` must match), with `--path` made absolute; otherwise it imports directly.
 
 ## Modules
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | CLI (runs the server by default; `import` and `token-path` subcommands), limits validation, graceful shutdown on Ctrl-C or SIGTERM with a 10 second drain. |
-| `src/app.rs` | Router, admin and client authentication, admin sessions, origin checks, connection/route/key CRUD, OAuth HTTP routes, events socket, embedded assets, body limits. |
+| `src/main.rs` | CLI (runs the server by default; `import` and `token-path` subcommands), limits validation, `runtime.json` for CLI handoff, graceful shutdown on Ctrl-C or SIGTERM with a 10 second drain. |
+| `src/app.rs` | Router, admin and client authentication, admin sessions, origin checks, connection/route/key CRUD, connection health, model catalog discovery, request lookup, OAuth HTTP routes, events socket, embedded assets, body limits. |
 | `src/proxy.rs` | Target selection, upstream authentication and protocol headers, HTTP and SSE transport, Codex payload shaping, Chat Completions translation, provider error mapping, Responses WebSocket bridge. |
 | `src/resilience.rs` | Account cooldowns (in memory) and response affinity (memory plus SQLite). |
 | `src/credentials.rs` | Read-only imports, account identity, source-owned token adoption, gateway-owned refresh. |
@@ -21,7 +21,7 @@ Switchyard is one Rust binary. It serves the management API, the inference gatew
 2. **Select targets.** A route (if one exists for the model) or every enabled connection that lists the model. Round-robin routes and implicit pools rotate a process-wide cursor; failover routes keep their order. Targets that cannot speak the requested endpoint, and targets cooling down, are removed. If every matching target is cooling, the client gets 429 with `Retry-After` and no provider is contacted.
 3. **Apply affinity.** A request with `previous_response_id` is pinned to the account that produced that response. If that account is disabled, cooling or no longer routed, the client gets 409. An unknown id is forwarded only when exactly one account can serve the model; otherwise 409.
 4. **Acquire a permit.** One semaphore bounds HTTP requests and WebSocket sessions together (`--max-in-flight`). A paused gateway returns 503; a full one returns 429 with `Retry-After: 1`.
-5. **Call upstream.** The token is renewed first if needed (see [account sign-in](oauth.md)). Only protocol headers are forwarded: `anthropic-version`, `anthropic-beta` (merged with the OAuth beta for Claude sign-ins), `openai-beta` and `idempotency-key`. Client keys, cookies and other headers never reach the provider. Redirects are not followed.
+5. **Call upstream.** The token is renewed first if it is known to be expiring (see [account sign-in](oauth.md)). If the provider answers 401 for an OAuth-based account, Switchyard renews the token (or adopts a newer one from an imported source) once and retries that account once; only then does the failure count toward failover. Only protocol headers are forwarded: `anthropic-version`, `anthropic-beta` (merged with the OAuth beta for Claude sign-ins), `openai-beta` and `idempotency-key`. Client keys, cookies and other headers never reach the provider. Redirects are not followed.
 6. **Fail over or answer.** Before any response bytes are delivered, a definite connection failure, a 401/403/429/502/503/504, or a failed token renewal moves to the next target and cools the failed one. A timeout after the request was sent is not retried, because the provider may have acted on it.
 7. **Deliver.** Streams are forwarded chunk by chunk as the client reads them. Non-streaming responses are collected with a 16 MiB cap. Codex is always called with SSE and collected when the client did not ask to stream.
 8. **Record.** A guard owns the permit for the full life of the response body or socket. When it drops (completion, error or client disconnect) it releases the permit, writes one metadata record and broadcasts it to dashboards. Prompts and outputs are never stored.
@@ -40,9 +40,22 @@ A stream counts as complete only when its protocol says so: `response.completed`
 
 ## Resilience state
 
-- **Cooldowns** are kept in memory per connection and model, from 1 second to 1 hour. The duration comes from `Retry-After` (seconds or HTTP date), the provider's `resets_in_seconds` or `resets_at`, or `anthropic-ratelimit-unified-reset`; otherwise 60 seconds for 429 and 10 seconds for other failures. A 401 or 403 cools the whole account; other failures cool only that model. Saving a connection, a reimport that updates its token, and a token renewal clear its cooldowns. At most 4,096 entries are kept.
+- **Cooldowns** are kept in memory per connection and model (reported in connection health), from 1 second to 1 hour. The duration comes from `Retry-After` (seconds or HTTP date), the provider's `resets_in_seconds` or `resets_at`, or `anthropic-ratelimit-unified-reset`; otherwise 60 seconds for 429 and 10 seconds for other failures. A 401 or 403 cools the whole account; other failures cool only that model. Saving a connection, a reimport that updates its token, and a token renewal clear its cooldowns. At most 4,096 entries are kept.
 - **Response affinity** maps a response id to its connection. It is written to SQLite (`response_affinity`) and loaded at startup, keeps at most 4,096 entries for one hour each, and contains no response content.
 - **Pending browser sign-ins** are in memory only; a restart abandons them.
+
+## Management API for the dashboard
+
+All `/api` routes except `/api/hello`, `/api/session` and `/healthz` need the admin token or an admin session, and pass the same-origin checks.
+
+- **`GET /api/hello`** (and `HEAD`) answers `{"status":"ok"}` without authentication, for connectivity probes. It reveals nothing and creates no session.
+- **`GET /api/connections`** returns each connection's public fields plus:
+  - `health.status`: `disabled` (turned off), `cooling` (account-wide cooldown after a 401 or 403), `limited` (one or more models cooling) or `ready`. This reflects routing cooldowns only; it is not a network probe. Use the connection test for that.
+  - `health.cooldowns`: `[{model, retry_after_seconds}]`, where an account-wide cooldown has model `"*"`.
+  - `health.last_used_at`, `last_status`, `last_error`: from the newest retained request served by this connection, or `null`. A connection that was tried and failed over does not get a record.
+  - `credential_expires_at`: Unix seconds when the token's expiry is known, else `null`.
+- **`GET /api/connections/{id}/models`** reads the provider's model catalog and returns `{connection_id, models:[{id, name}]}`, sorted and deduplicated. It understands OpenAI and Anthropic (`data[].id`), Codex (`models[].slug`) and Gemini (`models[].name` without the `models/` prefix), using `display_name` or `displayName` when present. It takes the first 1,000 entries, skips identifiers that are empty or longer than 200 characters, reads at most 2 MiB, and gives up after 20 seconds. A 401 gets one token renewal or adoption and one retry. It never changes the connection's configured models; the caller saves a selection with `PUT /api/connections/{id}`. Failures return a generic message suggesting manual entry, never the provider's response body.
+- **`GET /api/requests/{id}`** returns one retained history record, or 404 once it has been pruned from the newest 1,000.
 
 ## Persistence and concurrency
 

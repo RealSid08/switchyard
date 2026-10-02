@@ -13,11 +13,12 @@ Inspired by [Maria's request](https://x.com/maria_rcks/status/210586832185398497
 ## What it does
 
 - **Embedded control room.** Overview, connections, model routes, request activity, playground, client keys, client setup snippets and settings, served from the same binary.
-- **Native endpoints.** OpenAI Responses and Chat Completions, Anthropic Messages and Gemini `generateContent`/`streamGenerateContent`. Provider fields and errors pass through instead of being guessed.
+- **Native endpoints.** OpenAI Responses and Chat Completions, Anthropic Messages and token counting, and Gemini `generateContent`/`streamGenerateContent`. Provider fields and errors pass through instead of being guessed.
 - **Codex and Claude accounts.** Sign in with your browser (PKCE) to get an account Switchyard refreshes itself, or import an existing Codex CLI, Claude Code or CLIProxyAPI login read-only. Codex also gets a Chat Completions adapter.
 - **Persistent Responses WebSockets.** One upstream socket per client socket, bidirectional, for many `response.create` turns, tool results and `previous_response_id`.
 - **Streaming that tells the truth.** SSE is forwarded incrementally with backpressure and cancellation. A stream that ends without its protocol's completion marker gets a structured `upstream_interrupted` error event and is logged as a failure, not a success.
 - **Multi-account reliability.** Round-robin and failover routes, account cooldowns that follow `Retry-After` and provider reset hints, and response affinity that keeps a conversation on the account that owns it, even across restarts.
+- **Account visibility.** Each connection shows whether it is ready, rate limited per model, cooling down or disabled, with its last result and credential expiry. The provider's own model catalog can be listed to choose identifiers, and any request still in the history can be looked up by id.
 - **Private by default.** Loopback bind, separate admin and client credentials, hashed client keys, per-browser admin sessions with logout, metadata-only request history.
 
 Switchyard is an independent implementation, not a full port of every CLIProxyAPI provider. See the [compatibility guide](docs/compatibility.md) for exact protocol behavior and limits.
@@ -49,13 +50,13 @@ curl http://127.0.0.1:7410/v1/responses \
   -d '{"model":"gpt-6.1-sol","input":"Explain this repository","stream":true}'
 ```
 
-Imports are also available from the command line. They read files on the **machine running Switchyard** and never modify them. Only one Switchyard process can use a data directory at a time, so stop the server first (or import from the Connections screen while it runs):
+Imports are also available from the command line. They read files on the **machine running Switchyard** and never modify them. If the server is running, the CLI hands the import to it through the admin API (pass the same `--port` the server uses); otherwise it writes to the data directory directly. Relative `--path` values are resolved from your current directory.
 
 ```sh
 switchyard import codex                 # $CODEX_HOME/auth.json or ~/.codex/auth.json
 switchyard import claude                # $CLAUDE_CONFIG_DIR or ~/.claude, then the macOS Keychain
 switchyard import cliproxy --path /path/to/cliproxy/auths
-switchyard token-path                   # where the admin token lives (server stopped)
+switchyard token-path                   # where the admin token lives
 switchyard --help
 ```
 

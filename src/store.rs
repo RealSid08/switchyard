@@ -57,11 +57,38 @@ pub struct Route {
     pub targets: Vec<Target>,
     pub strategy: String,
 }
+/// At most this many upstream attempts are kept per request record (20 accounts, each with at
+/// most one same-account credential retry).
+pub const MAX_ATTEMPTS: usize = 40;
+
+/// One upstream attempt made while serving a request. Never contains prompts, bodies, tokens or
+/// provider-supplied text.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RequestAttempt {
+    pub connection_id: String,
+    pub connection_name: String,
+    /// The model name sent upstream (after route mapping).
+    pub model: String,
+    /// Upstream HTTP status. `101` is an accepted WebSocket handshake; `0` means no HTTP
+    /// response was received (credential unavailable, connection failed, or timed out).
+    pub status: u16,
+    /// From the start of the attempt (including any credential refresh) until it was decided:
+    /// response headers received, handshake finished, or the failure was observed.
+    pub duration_ms: u64,
+    /// A constant label from a fixed vocabulary (for example `rate_limited`), never provider text.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// One row of the request log. Fields added after the first release are `serde(default)` so
+/// older rows still load. A WebSocket session is a single row: its timings describe the first
+/// turn of the session.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RequestRecord {
     pub id: String,
     pub timestamp: String,
     pub model: String,
+    /// The connection that served (or last attempted) the request.
     pub connection_id: String,
     pub connection_name: String,
     pub transport: String,
@@ -70,6 +97,26 @@ pub struct RequestRecord {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
+    /// The requested model when it is a stored route alias; `None` for direct model names.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// How many times the request moved to a different account. A same-account retry after a
+    /// credential refresh is an attempt, not a failover.
+    #[serde(default)]
+    pub failovers: u32,
+    /// Upstream attempts in order, bounded by [`MAX_ATTEMPTS`].
+    #[serde(default)]
+    pub attempts: Vec<RequestAttempt>,
+    /// Milliseconds from the start of the request (including earlier failed attempts) until the
+    /// first body byte of the successful upstream response; for WebSockets, the first upstream
+    /// frame after the first `response.create`. `None` if no successful body arrived.
+    #[serde(default)]
+    pub ttfb_ms: Option<u64>,
+    /// Milliseconds from the start of the request until the first non-empty output delta: text,
+    /// refusal, tool-call arguments or reasoning/thinking. `None` for responses delivered as a
+    /// single JSON document or when no output was produced.
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
 }
 pub struct Store {
     db: Mutex<Sqlite>,
