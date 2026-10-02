@@ -25,6 +25,7 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn app() -> (tempfile::TempDir, App) {
     let d = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
