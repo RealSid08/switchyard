@@ -14,8 +14,9 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { WebSocketServer, type WebSocket } from 'ws';
+import { createUsageMock } from './usage.ts';
 
-type Kind = 'openai' | 'anthropic' | 'gemini' | 'codex';
+type Kind = 'openai' | 'anthropic' | 'gemini' | 'codex' | 'antigravity';
 interface Conn {
   id: string;
   name: string;
@@ -26,7 +27,7 @@ interface Conn {
   supports_websocket: boolean;
   created_at: string;
   secret: string;
-  source: 'api_key' | 'native_codex' | 'native_claude' | 'cliproxy' | 'oauth';
+  source: 'api_key' | 'native_codex' | 'native_claude' | 'native_antigravity' | 'native_opencode' | 'cliproxy' | 'oauth';
   /** Unix seconds the credential expires, if known. */
   expires?: number;
 }
@@ -108,7 +109,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   /* ---------- browser sign-in (OAuth) ---------- */
   interface Flow {
     id: string;
-    provider: 'codex' | 'claude';
+    provider: 'codex' | 'claude' | 'antigravity';
     state: string;
     status: 'pending' | 'complete' | 'error' | 'expired';
     expires: number;
@@ -118,7 +119,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   const flows = new Map<string, Flow>();
   let oauthTtl = 300;
   let oauthBusy = false;
-  const OAUTH_PORTS = { codex: 1455, claude: 54545 } as const;
+  const OAUTH_PORTS = { codex: 1455, claude: 54545, antigravity: 51121 } as const;
   const flowView = (f: Flow) => {
     if (f.status === 'pending' && Date.now() > f.expires) {
       f.status = 'expired';
@@ -135,17 +136,17 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   };
   /** Completing a sign-in creates (or refreshes, for the same account) a gateway-owned connection. */
   function completeFlow(f: Flow, account: string) {
-    const kind: Kind = f.provider === 'codex' ? 'codex' : 'anthropic';
+    const kind: Kind = f.provider === 'codex' ? 'codex' : f.provider === 'antigravity' ? 'antigravity' : 'anthropic';
     const secret = `oauth-${f.provider}-${account}`;
     let c = connections.find((x) => x.kind === kind && x.secret === secret);
     if (!c) {
       c = {
         id: randomUUID(),
-        name: f.provider === 'codex' ? `ChatGPT · ${account}` : `Claude · ${account}`,
+        name: f.provider === 'codex' ? `ChatGPT · ${account}` : f.provider === 'antigravity' ? `Antigravity · ${account}` : `Claude · ${account}`,
         kind,
-        base_url: f.provider === 'codex' ? 'https://chatgpt.com/backend-api/codex' : 'https://api.anthropic.com/v1',
+        base_url: f.provider === 'codex' ? 'https://chatgpt.com/backend-api/codex' : f.provider === 'antigravity' ? 'https://daily-cloudcode-pa.googleapis.com' : 'https://api.anthropic.com/v1',
         enabled: true,
-        models: f.provider === 'codex' ? ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'] : ['claude-opus-5-5', 'claude-sonnet-5-5'],
+        models: f.provider === 'codex' ? ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'] : f.provider === 'antigravity' ? ['gemini-3-pro', 'claude-sonnet-5-5'] : ['claude-opus-5-5', 'claude-sonnet-5-5'],
         supports_websocket: f.provider === 'codex',
         created_at: now(),
         secret,
@@ -190,8 +191,15 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
     for (const ws of eventSockets) if (ws.readyState === ws.OPEN) ws.send(text);
   }
 
+  // Usage ledger, limits and pricing (dev-only fixtures, see mock/usage.ts).
+  const usageMock = createUsageMock({
+    connections: () => connections.map((c) => ({ id: c.id, name: c.name, kind: c.kind, enabled: c.enabled, source: c.source, models: c.models })),
+    keys: () => keys.map((k) => ({ id: k.id, name: k.name })),
+  });
+
   function record(r: Omit<Rec, 'id' | 'timestamp'> & { timestamp?: string }, push = true) {
     const rec: Rec = { id: randomUUID(), timestamp: r.timestamp ?? now(), ...r } as Rec;
+    usageMock.recordGateway(rec);
     requests.unshift(rec);
     requests = requests.slice(0, 1000);
     counters.total++;
@@ -245,6 +253,8 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
     ];
     requests = [];
     counters = { total: 0, success: 0, failed: 0, http: 0, sse: 0, websocket: 0 };
+    usageMock.reset();
+    usageMock.seedHistory();
     for (let i = 240; i > 0; i--) record({ ...randomRequest(), timestamp: new Date(Date.now() - i * 14_000 - Math.random() * 9000).toISOString() }, false);
     requests.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
     broadcast({ type: 'overview', data: overview() });
@@ -327,6 +337,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
 
   function reset() {
     generation++;
+    usageMock.reset();
     flows.clear();
     cooldowns.clear();
     catalogReject = false;
@@ -490,6 +501,9 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
         case 'seed':
           seed();
           break;
+        case 'monitor-auth':
+          usageMock.breakMonitor();
+          break;
         case 'catalog-reject':
           catalogReject = true;
           break;
@@ -554,6 +568,16 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
       if (!isAdmin(req)) return fail(res, 401, 'Admin session required');
       await sleep(40 + Math.random() * 80); // feel like a network
       const body = method === 'POST' || method === 'PUT' ? await readBody(req) : null;
+      if (path.startsWith('/api/usage')) {
+        const u = await usageMock.handle(path, method, url, body);
+        if (u) {
+          if (u.status === 204) {
+            res.writeHead(204).end();
+            return;
+          }
+          return json(res, u.status, u.body);
+        }
+      }
       const seg = path.split('/').filter(Boolean); // ['api', ...]
 
       if (path === '/api/overview' && method === 'GET') return json(res, 200, overview());
@@ -660,7 +684,8 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
         const make = (name: string, kind: Kind, base: string, models: string[], ws: boolean, account: string) => {
           const existing = connections.find((c) => c.kind === kind && c.secret === account);
           if (existing) return existing;
-          const src: Conn['source'] = source === 'cliproxy' ? 'cliproxy' : kind === 'codex' ? 'native_codex' : 'native_claude';
+          const src: Conn['source'] =
+            source === 'cliproxy' ? 'cliproxy' : source === 'opencode' || source === 'opencode_go' ? 'native_opencode' : kind === 'codex' ? 'native_codex' : kind === 'antigravity' ? 'native_antigravity' : 'native_claude';
           const c: Conn = { id: randomUUID(), name, kind, base_url: base, enabled: true, models, supports_websocket: ws, created_at: now(), secret: account, source: src };
           connections.push(c);
           return c;
@@ -675,7 +700,15 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
             make('dev@example.com', 'codex', 'https://chatgpt.com/backend-api/codex', ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna'], true, 'cliproxy-codex'),
             make('dev@example.com', 'anthropic', 'https://api.anthropic.com/v1', ['claude-opus-5-5', 'claude-sonnet-5-5'], false, 'cliproxy-claude'),
           ];
-        } else return fail(res, 400, 'Supported imports: codex, claude, cliproxy');
+        } else if (source === 'antigravity') {
+          out = [make('Antigravity', 'antigravity', 'https://daily-cloudcode-pa.googleapis.com', ['gemini-3-pro', 'claude-sonnet-5-5'], false, 'agy-account-1')];
+        } else if (source === 'opencode' || source === 'opencode_go') {
+          // Mirrors the providers contract: one connection per API family on the same Go key.
+          out = [
+            make('OpenCode Go', 'openai', 'https://opencode.ai/zen/go/v1', ['kimi-k2.5', 'glm-5'], false, 'opencode-go-key'),
+            make('OpenCode Go (Messages)', 'anthropic', 'https://opencode.ai/zen/go/v1', ['minimax-m2.5'], false, 'opencode-go-key-msgs'),
+          ];
+        } else return fail(res, 400, 'Supported imports: codex, claude, cliproxy, antigravity, opencode');
         broadcast({ type: 'overview', data: overview() });
         return json(res, 200, { imported: out.length, connections: out.map(publicConn), message: 'Credentials imported locally. Original files were not changed.' });
       }
@@ -733,9 +766,9 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
       }
       if (path === '/api/oauth/start' && method === 'POST') {
         const provider = body?.provider;
-        if (provider !== 'codex' && provider !== 'claude') return fail(res, 400, 'Choose codex or claude');
+        if (provider !== 'codex' && provider !== 'claude' && provider !== 'antigravity') return fail(res, 400, 'Choose codex, claude or antigravity');
         if (oauthBusy)
-          return fail(res, 409, `Sign-in callback port ${OAUTH_PORTS[provider as 'codex' | 'claude']} is already in use. Close any running codex login, claude login or CLIProxyAPI login, then retry.`);
+          return fail(res, 409, `Sign-in callback port ${OAUTH_PORTS[provider as 'codex' | 'claude' | 'antigravity']} is already in use. Close any running codex login, claude login or CLIProxyAPI login, then retry.`);
         for (const f of flows.values()) {
           if (f.provider === provider && f.status === 'pending') {
             f.status = 'error';

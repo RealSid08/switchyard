@@ -1,7 +1,7 @@
 import { CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, type LucideIcon } from 'lucide-react';
 import { useId, useRef, type ComponentPropsWithRef, type CSSProperties, type KeyboardEvent, type ReactNode } from 'react';
 import { outcome, statusCode } from '../lib/format';
-import type { ConnectionKind, RequestRecord } from '../lib/types';
+import type { RequestRecord } from '../lib/types';
 
 type ButtonVariant = 'default' | 'primary' | 'ghost' | 'danger' | 'danger-ghost';
 
@@ -209,18 +209,27 @@ export function Callout({ tone = 'info', title, children, action, icon, role, qu
   );
 }
 
-const KIND_LABEL: Record<ConnectionKind, string> = { openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini', codex: 'Codex' };
-const KIND_GLYPH: Record<ConnectionKind, string> = { openai: 'OA', anthropic: 'A\\', gemini: 'G', codex: '>_' };
+const KIND_LABEL: Record<string, string> = {
+  openai: 'OpenAI',
+  anthropic: 'Anthropic',
+  gemini: 'Gemini',
+  codex: 'Codex',
+  antigravity: 'Antigravity',
+  cursor: 'Cursor',
+  opencode: 'OpenCode',
+};
+const KIND_GLYPH: Record<string, string> = { openai: 'OA', anthropic: 'A\\', gemini: 'G', codex: '>_', antigravity: 'AG', cursor: 'Cu', opencode: 'OC' };
 
 export function kindLabel(kind: string): string {
-  return KIND_LABEL[kind as ConnectionKind] ?? kind;
+  return KIND_LABEL[kind] ?? (kind ? kind.charAt(0).toUpperCase() + kind.slice(1) : 'Unknown');
 }
 
+/** Provider monogram. Unknown kinds get a neutral mark with their initials rather than another brand's. */
 export function KindMark({ kind, size }: { kind: string; size?: 'sm' | 'lg' }) {
-  const k = (kind in KIND_GLYPH ? kind : 'openai') as ConnectionKind;
+  const known = kind in KIND_GLYPH;
   return (
-    <span className={`kind-mark kind-${k} ${size ?? ''}`} aria-hidden>
-      {KIND_GLYPH[k]}
+    <span className={`kind-mark kind-${known ? kind : 'other'} ${size ?? ''}`} aria-hidden>
+      {known ? KIND_GLYPH[kind] : (kind || '?').slice(0, 2).toUpperCase()}
     </span>
   );
 }

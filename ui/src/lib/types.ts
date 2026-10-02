@@ -1,6 +1,6 @@
 // Wire types for the Switchyard admin API. Keep these aligned with docs/UI.md.
 
-export type ConnectionKind = 'openai' | 'anthropic' | 'gemini' | 'codex';
+export type ConnectionKind = 'openai' | 'anthropic' | 'gemini' | 'codex' | 'antigravity';
 export type Transport = 'http' | 'sse' | 'websocket';
 export type RouteStrategy = 'round_robin' | 'failover';
 
@@ -122,7 +122,7 @@ export interface Connection {
  */
 export type CredentialSource = 'api_key' | 'native_codex' | 'native_claude' | 'cliproxy' | 'oauth';
 
-export type OAuthProvider = 'codex' | 'claude';
+export type OAuthProvider = 'codex' | 'claude' | 'antigravity';
 export type OAuthStatus = 'pending' | 'complete' | 'error' | 'expired';
 
 export interface OAuthFlow {
@@ -153,7 +153,7 @@ export interface ConnectionTestResult {
   message: string;
 }
 
-export type ImportSource = 'codex' | 'claude' | 'cliproxy';
+export type ImportSource = 'codex' | 'claude' | 'cliproxy' | 'antigravity' | 'opencode' | 'opencode_go';
 
 export interface ImportResult {
   imported: number;

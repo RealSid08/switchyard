@@ -1,14 +1,15 @@
 //! Credential import and lifecycle.
 //!
 //! Ownership rules (see docs/oauth.md):
-//! - `native_codex`, `native_claude` and `cliproxy` connections are *source-owned*. Their refresh
+//! - `native_codex`, `native_claude`, `native_agy` and `cliproxy` connections are *source-owned*. Their refresh
 //!   tokens are shared with another program, and OAuth refresh tokens are single-use, so the
 //!   gateway never refreshes them. When the access token expires it rereads the read-only source
 //!   and adopts a newer token written there by the owning CLI; otherwise it fails with a clear 401.
 //! - `oauth` connections came from the gateway's own PKCE sign-in (src/oauth.rs). The gateway owns
 //!   that token family and refreshes it under the per-account lock.
-//! - `api_key` connections never refresh.
+//! - `api_key` and `native_opencode` (OpenCode Zen/Go keys) connections never refresh.
 use crate::{
+    antigravity,
     app::{ApiError, App, account_lock},
     oauth,
     store::{Connection, hash, id, now},
@@ -28,6 +29,13 @@ pub const SOURCE_NATIVE_CLAUDE: &str = "native_claude";
 pub const SOURCE_CLIPROXY: &str = "cliproxy";
 pub const SOURCE_OAUTH: &str = "oauth";
 pub const SOURCE_API_KEY: &str = "api_key";
+/// Antigravity CLI (`agy`) file token storage, read-only.
+pub const SOURCE_NATIVE_AGY: &str = "native_agy";
+/// OpenCode's `auth.json` API keys (Zen and Go), read-only.
+pub const SOURCE_NATIVE_OPENCODE: &str = "native_opencode";
+/// OpenCode Zen and Go API bases (https://opencode.ai/docs/zen, https://opencode.ai/docs/go).
+pub const OPENCODE_ZEN_BASE: &str = "https://opencode.ai/zen/v1";
+pub const OPENCODE_GO_BASE: &str = "https://opencode.ai/zen/go/v1";
 /// `source_path` marker for the macOS Keychain record written by Claude Code.
 pub const KEYCHAIN_CLAUDE: &str = "keychain:Claude Code-credentials";
 
@@ -364,6 +372,28 @@ fn parse_cliproxy(v: &Value, source_path: &str) -> Option<Parsed> {
                 models: claude_models(),
             })
         }
+        "antigravity" if !token.is_empty() => Some(Parsed {
+            name: if email.is_empty() {
+                "Antigravity account".into()
+            } else {
+                email.into()
+            },
+            kind: antigravity::KIND,
+            base: antigravity::DAILY_BASE,
+            token: token.into(),
+            refresh_token: str_of(v, &["refresh_token"]).into(),
+            expires_at: parse_expiry(v, token),
+            account_id: str_of(v, &["project_id"]).into(),
+            identity: if email.is_empty() {
+                antigravity::identity_for_source(source_path)
+            } else {
+                antigravity::identity_for_email(email)
+            },
+            source: SOURCE_CLIPROXY,
+            source_path: source_path.into(),
+            oauth: true,
+            models: antigravity::default_models(),
+        }),
         "openai" | "codex" => {
             let key = str_of(v, &["api_key"]);
             (!key.is_empty()).then(|| {
@@ -380,6 +410,154 @@ fn parse_cliproxy(v: &Value, source_path: &str) -> Option<Parsed> {
         }
         _ => None,
     }
+}
+
+/// Antigravity CLI file token (`~/.gemini/antigravity-cli/antigravity-oauth-token`):
+/// `{"token":{"access_token","refresh_token","expiry"},"auth_method","id_token"?}`. `agy` uses
+/// this file only when the OS keyring is unavailable; the keyring is never read.
+fn parse_native_agy(v: &Value, source_path: &str) -> Result<Parsed, ApiError> {
+    // Only agy's own shape is accepted, so another program's file is never mistaken for it.
+    let t = &v["token"];
+    let token = str_of(t, &["access_token"]);
+    if !t.is_object() || token.is_empty() {
+        return Err(ApiError::bad(
+            "No Antigravity access token found. Run agy once to sign in, then retry.",
+        ));
+    }
+    let claims = jwt_claims(str_of(v, &["id_token"]));
+    let email = claims
+        .as_ref()
+        .and_then(|c| c["email"].as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(Parsed {
+        name: if email.is_empty() {
+            "Antigravity CLI".into()
+        } else {
+            email.clone()
+        },
+        kind: antigravity::KIND,
+        base: antigravity::DAILY_BASE,
+        token: token.into(),
+        refresh_token: str_of(t, &["refresh_token", "refreshToken"]).into(),
+        expires_at: parse_expiry(t, token),
+        account_id: String::new(),
+        identity: if email.is_empty() {
+            antigravity::identity_for_source(source_path)
+        } else {
+            antigravity::identity_for_email(&email)
+        },
+        source: SOURCE_NATIVE_AGY,
+        source_path: source_path.into(),
+        oauth: true,
+        models: antigravity::default_models(),
+    })
+}
+
+/// Suggested models per OpenCode endpoint, from the official Zen and Go endpoint tables
+/// (2026-10-03). Editable starting points; model discovery reads the live catalog.
+const OPENCODE_ZEN_OPENAI: &[&str] = &[
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.3-codex",
+    "grok-4.7",
+    "qwen3.8-max",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "minimax-m3",
+    "glm-5.3",
+    "kimi-k3",
+    "big-pickle",
+];
+const OPENCODE_ZEN_ANTHROPIC: &[&str] = &[
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+    "qwen3.8-flash",
+    "qwen3.7-max",
+];
+const OPENCODE_GO_OPENAI: &[&str] = &[
+    "grok-4.7",
+    "grok-4.6",
+    "gpt-6-luna",
+    "gpt-5.6-luna",
+    "glm-5.3-flash",
+    "glm-5.3",
+    "glm-5.2",
+    "kimi-k3",
+    "kimi-k2.7-code",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "mimo-v2.6-pro",
+];
+const OPENCODE_GO_ANTHROPIC: &[&str] = &[
+    "minimax-m3",
+    "minimax-m2.7",
+    "qwen3.8-max",
+    "qwen3.8-flash",
+    "qwen3.7-plus",
+];
+
+/// OpenCode `auth.json` (`~/.local/share/opencode/auth.json`): top-level provider ids mapping to
+/// `{"type":"api","key":...}`. Zen (`opencode`) and Go (`opencode-go`) keys each become two
+/// connections on the same key: OpenAI-compatible (Responses and Chat) and Anthropic Messages.
+/// Other providers in the file are not imported. Zen's Gemini-family models use a Google AI SDK
+/// endpoint that Switchyard does not route, so they are not offered.
+fn parse_opencode(v: &Value, source_path: &str) -> Vec<Parsed> {
+    let mut out = Vec::new();
+    for (provider, product, base, openai, anthropic) in [
+        (
+            "opencode",
+            "OpenCode Zen",
+            OPENCODE_ZEN_BASE,
+            OPENCODE_ZEN_OPENAI,
+            OPENCODE_ZEN_ANTHROPIC,
+        ),
+        (
+            "opencode-go",
+            "OpenCode Go",
+            OPENCODE_GO_BASE,
+            OPENCODE_GO_OPENAI,
+            OPENCODE_GO_ANTHROPIC,
+        ),
+    ] {
+        let entry = &v[provider];
+        if entry["type"] != "api" {
+            continue;
+        }
+        let key = str_of(entry, &["key"]);
+        if key.is_empty() || key.len() > 4096 || key.chars().any(char::is_control) {
+            continue;
+        }
+        for (kind, suffix, models) in [
+            ("openai", "", openai),
+            ("anthropic", " (Messages)", anthropic),
+        ] {
+            out.push(Parsed {
+                name: format!("{product}{suffix}"),
+                kind,
+                base,
+                token: key.into(),
+                refresh_token: String::new(),
+                expires_at: 0,
+                account_id: String::new(),
+                identity: hash(&format!("v1|opencode|{provider}|{kind}|{}", hash(key))),
+                source: SOURCE_NATIVE_OPENCODE,
+                source_path: source_path.into(),
+                oauth: false,
+                models: models.iter().map(|m| m.to_string()).collect(),
+            });
+        }
+    }
+    out
 }
 
 fn home() -> Result<PathBuf, ApiError> {
@@ -411,6 +589,15 @@ async fn claude_profile() -> Option<Value> {
     };
     // The profile can be large (project history); read it with a higher bound, metadata only.
     read_bounded(&p, 16 * 1024 * 1024).await.ok()
+}
+fn agy_default() -> Result<PathBuf, ApiError> {
+    Ok(home()?.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+}
+fn opencode_default() -> Result<PathBuf, ApiError> {
+    Ok(match std::env::var_os("XDG_DATA_HOME") {
+        Some(d) if !d.is_empty() => PathBuf::from(d).join("opencode/auth.json"),
+        _ => home()?.join(".local/share/opencode/auth.json"),
+    })
 }
 async fn canonical(p: &Path) -> String {
     tokio::fs::canonicalize(p)
@@ -486,7 +673,42 @@ pub async fn import(
                 }
             }
         }
-        _ => return Err(ApiError::bad("Supported imports: codex, claude, cliproxy")),
+        "antigravity" => {
+            let p = match path {
+                Some(p) => PathBuf::from(p),
+                None => agy_default()?,
+            };
+            let v = read(&p).await.map_err(|e| {
+                if path.is_none() {
+                    ApiError::bad("No Antigravity CLI token file found. agy keeps its login in the OS keyring unless the keyring is unavailable; sign in with the browser instead, or choose a CLIProxyAPI antigravity file.")
+                } else {
+                    e
+                }
+            })?;
+            values.push(parse_native_agy(&v, &canonical(&p).await)?);
+        }
+        "opencode" | "opencode_go" => {
+            let p = match path {
+                Some(p) => PathBuf::from(p),
+                None => opencode_default()?,
+            };
+            let v = read(&p).await?;
+            let mut parsed = parse_opencode(&v, &canonical(&p).await);
+            if source == "opencode_go" {
+                parsed.retain(|item| item.base == OPENCODE_GO_BASE);
+            }
+            if parsed.is_empty() {
+                return Err(ApiError::bad(
+                    "No OpenCode Zen or Go API key found. Run opencode auth login and choose OpenCode Zen or OpenCode Go.",
+                ));
+            }
+            values.extend(parsed);
+        }
+        _ => {
+            return Err(ApiError::bad(
+                "Supported imports: codex, claude, cliproxy, antigravity, opencode",
+            ));
+        }
     }
     if values.is_empty() {
         return Err(ApiError::bad("No supported credentials found"));
@@ -729,6 +951,12 @@ fn reauth_message(c: &Connection) -> &'static str {
         (SOURCE_CLIPROXY, _) => {
             "This CLIProxyAPI account file has an expired token. Let CLIProxyAPI refresh it, or sign in from the control room, then retry."
         }
+        (SOURCE_NATIVE_AGY, _) => {
+            "Antigravity CLI sign-in for this account has expired. Run agy once on this machine, then retry. For an account the gateway refreshes itself, sign in from the control room."
+        }
+        (SOURCE_NATIVE_OPENCODE, _) => {
+            "OpenCode rejected this API key. Run opencode auth login again, then reimport."
+        }
         (SOURCE_OAUTH, _) => {
             "This account's sign-in was revoked or expired. Sign in again from the control room."
         }
@@ -786,7 +1014,7 @@ async fn renew(app: &App, c: &mut Connection, forced: bool) -> Result<(), ApiErr
         return Ok(());
     }
     match latest.credential_source.as_str() {
-        SOURCE_NATIVE_CODEX | SOURCE_NATIVE_CLAUDE | SOURCE_CLIPROXY => {
+        SOURCE_NATIVE_CODEX | SOURCE_NATIVE_CLAUDE | SOURCE_CLIPROXY | SOURCE_NATIVE_AGY => {
             let p = reread_source(&latest).await.map_err(|_| {
                 ApiError::new(
                     401,
@@ -891,6 +1119,10 @@ async fn reread_source(c: &Connection) -> Result<Parsed, ApiError> {
                 None
             };
             parse_native_claude(&v, &c.source_path, profile.as_ref())
+        }
+        SOURCE_NATIVE_AGY => {
+            let v = read(Path::new(&c.source_path)).await?;
+            parse_native_agy(&v, &c.source_path)
         }
         SOURCE_CLIPROXY => {
             let v = read(Path::new(&c.source_path)).await?;

@@ -15,6 +15,7 @@ import { OverviewPage } from './pages/Overview';
 import { PlaygroundPage } from './pages/Playground';
 import { RoutesPage } from './pages/Routes';
 import { SettingsPage } from './pages/Settings';
+import { UsagePage } from './pages/Usage';
 
 // Dev-only mock controls. `import.meta.env.VITE_SWITCHYARD_MOCK` is undefined in
 // production builds, so this branch (and the module) is dropped entirely.
@@ -28,6 +29,7 @@ function Page() {
   if (path === '/activity') return <ActivityPage />;
   const detail = matchPath('/activity/:id', path);
   if (detail) return <ActivityPage selectedId={detail.id} />;
+  if (path === '/usage' || path === '/usage/limits' || path === '/usage/pricing') return <UsagePage />;
   if (path === '/playground') return <PlaygroundPage />;
   if (path === '/clients') return <ClientsPage />;
   if (path === '/keys') return <KeysPage />;

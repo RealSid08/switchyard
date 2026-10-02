@@ -152,14 +152,17 @@ export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
       };
     }
     case 'opencode': {
+      // OpenCode v2 reads the same provider block as v1 (schema: opencode.ai/config.json).
+      // Use the native SDK for the model's family so tools, reasoning and caching keep their semantics.
+      const anthropic = input.modelKind === 'anthropic';
       const config = JSON.stringify(
         {
           $schema: 'https://opencode.ai/config.json',
           provider: {
             switchyard: {
-              npm: '@ai-sdk/openai-compatible',
+              npm: anthropic ? '@ai-sdk/anthropic' : '@ai-sdk/openai',
               name: 'Switchyard',
-              options: { baseURL: urls.openai, apiKey: `{env:${KEY_ENV}}` },
+              options: { baseURL: anthropic ? `${urls.anthropic}/v1` : urls.openai, apiKey: `{env:${KEY_ENV}}` },
               models: { [model]: { name: model } },
             },
           },
@@ -171,13 +174,20 @@ export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
       return {
         id,
         label: 'OpenCode',
-        blurb: 'Register Switchyard as an OpenAI-compatible provider.',
-        speaks: 'openai',
+        blurb: anthropic
+          ? 'Register Switchyard as a provider using the Anthropic Messages API, which this model speaks.'
+          : 'Register Switchyard as a provider using the OpenAI Responses API.',
+        speaks: 'any',
         blocks: [
           { title: 'Export your client key', language: 'bash', code: exportKey },
           { title: 'Add the provider', language: 'json', code: config, path: 'opencode.json (project) or ~/.config/opencode/opencode.json' },
+          { title: 'Run it', language: 'bash', code: `opencode run --model ${shellQuote(`switchyard/${model}`)} "Say hello from Switchyard"` },
         ],
-        notes: ['Add more entries under "models" for every route you want to pick from inside OpenCode.'],
+        notes: [
+          'Written for OpenCode v2 (checked against its official config schema). The same block works in v1.',
+          'Add more entries under "models" for each route you want to pick inside OpenCode. For models from both API families, add a second provider with the other SDK.',
+          'This sets OpenCode up to send traffic through Switchyard. To route Switchyard traffic through your OpenCode Zen or Go account instead, import its key on Connections; that’s a separate thing.',
+        ],
       };
     }
     case 'cursor': {
@@ -193,7 +203,8 @@ export function buildGuide(id: ClientId, input: SnippetInput): ClientGuide {
           { title: 'Tools that read OpenAI environment variables', language: 'bash', code: env },
         ],
         notes: [
-          'Cursor sends custom-model traffic through its own servers, so it cannot reach a gateway on 127.0.0.1. Expose Switchyard on a reachable address (for example over Tailscale) first.',
+          'Cursor routes custom-model requests through its own servers, so it can’t reach 127.0.0.1 or a private network. Give Switchyard a public HTTPS address (for example a reverse proxy or Tailscale Funnel) and use a dedicated client key.',
+          'Cursor’s custom keys apply to chat models only, not Tab. Cursor’s own models (like Composer) have no external API, so Switchyard can’t route traffic to them; you can still watch a Cursor account’s usage on the Usage page.',
           'Editors that call the API from your machine (Continue, Cline, Aider, Zed) work with the local address as-is.',
         ],
       };

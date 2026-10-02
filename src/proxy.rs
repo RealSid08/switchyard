@@ -7,12 +7,14 @@
 //! client. After output has been forwarded, or after an ambiguous transport failure once the
 //! request was sent, nothing is replayed; the client receives an explicit partial-output error.
 use crate::{
+    antigravity,
     app::{ApiError, App},
     credentials,
     store::{Connection, MAX_ATTEMPTS, RequestAttempt, RequestRecord, Route, id, now},
+    usage::{self, ClientIdentity, UnitContext, UsageAccumulator, WsTurns},
 };
 use axum::{
-    Json,
+    Extension, Json,
     body::{Body, Bytes},
     extract::{
         Path, Query, State,
@@ -172,6 +174,9 @@ fn cool_for_status(app: &App, connection: &str, model: &str, status: u16, second
 // ---------------------------------------------------------------------------------------------
 
 pub fn upstream_headers(req: reqwest::RequestBuilder, c: &Connection) -> reqwest::RequestBuilder {
+    if c.kind == antigravity::KIND {
+        return antigravity::apply_headers(req, &c.api_key);
+    }
     let req = match c.kind.as_str() {
         "anthropic" if !c.oauth => req.header("x-api-key", &c.api_key),
         "gemini" => req.header("x-goog-api-key", &c.api_key),
@@ -210,6 +215,15 @@ fn protocol_headers(h: &HeaderMap, c: &Connection) -> HeaderMap {
     if let Some(v) = h.get("idempotency-key") {
         out.insert("idempotency-key", v.clone());
     }
+    if crate::usage::provider_for(c) == "opencode_go" {
+        if let Some(v) = h.get("x-opencode-session") {
+            out.insert("x-opencode-session", v.clone());
+        }
+        out.insert(
+            "user-agent",
+            HeaderValue::from_static(concat!("switchyard/", env!("CARGO_PKG_VERSION"))),
+        );
+    }
     match c.kind.as_str() {
         "anthropic" => {
             if let Some(v) = h.get("anthropic-version") {
@@ -227,6 +241,33 @@ fn protocol_headers(h: &HeaderMap, c: &Connection) -> HeaderMap {
         _ => {}
     }
     out
+}
+
+// Only hashes leave the gateway; neither prompts nor native session identifiers are stored.
+// A partial-history client must supply a session header to preserve conversation routing.
+fn go_session(h: &HeaderMap, body: &Value, client: &str) -> String {
+    let native = [
+        "x-opencode-session",
+        "x-claude-code-session-id",
+        "session_id",
+        "x-codex-session-id",
+    ]
+    .iter()
+    .find_map(|name| {
+        h.get(*name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty() && v.len() <= 256)
+    });
+    let first_user = body["messages"]
+        .as_array()
+        .or_else(|| body["input"].as_array())
+        .and_then(|messages| messages.iter().find(|m| m["role"] == "user"));
+    let seed = native
+        .map(|v| format!("session:{v}"))
+        .or_else(|| first_user.map(|v| format!("message:{v}")))
+        .or_else(|| body["input"].as_str().map(|v| format!("input:{v}")))
+        .unwrap_or_else(|| format!("request:{}", crate::store::id()));
+    format!("sy-{}", crate::store::hash(&format!("{client}|{seed}")))
 }
 
 /// Merges every `anthropic-beta` header line (HTTP lists may be split over lines) into one
@@ -351,6 +392,16 @@ struct RecordGuard {
     last_connection: Option<String>,
     /// Timings are only captured while open; a WebSocket session closes them after its first turn.
     timing_open: bool,
+    /// Usage accounting (see `usage`): the serving connection's provider kind and billing, the
+    /// upstream model of the last attempt, the client's public identity and usage snapshots.
+    provider: Option<String>,
+    protocol: String,
+    billing: &'static str,
+    upstream_model: Option<String>,
+    client: Option<ClientIdentity>,
+    tokens: UsageAccumulator,
+    /// WebSocket sessions account each turn as its own ledger unit.
+    turns: Option<WsTurns>,
     _permit: OwnedSemaphorePermit,
 }
 impl RecordGuard {
@@ -387,7 +438,43 @@ impl RecordGuard {
             settled: false,
             last_connection: None,
             timing_open: true,
+            provider: Some(usage::provider_for(c).into()),
+            protocol: c.kind.clone(),
+            billing: usage::billing_for_connection(c),
+            upstream_model: None,
+            client: None,
+            tokens: UsageAccumulator::default(),
+            turns: (transport == "websocket").then(WsTurns::new),
             _permit: permit,
+        }
+    }
+    /// Attributes the request to a client key's public identity.
+    fn with_client(mut self, client: Option<ClientIdentity>) -> Self {
+        self.client = client;
+        self
+    }
+    fn unit_context(&self) -> UnitContext<'_> {
+        UnitContext {
+            provider: self.provider.as_deref(),
+            billing: self.billing,
+            upstream_model: self.upstream_model.as_deref(),
+            client: self.client.as_ref(),
+            usage: &self.tokens,
+        }
+    }
+    /// Writes finished WebSocket turns to the usage ledger.
+    fn record_turns(&self, closed: Vec<usage::ClosedTurn>) {
+        let Some(r) = &self.record else { return };
+        if closed.is_empty() {
+            return;
+        }
+        let cx = self.unit_context();
+        let events: Vec<_> = closed
+            .into_iter()
+            .map(|t| usage::event_for_turn(&self.app.store, r, t, &cx))
+            .collect();
+        if self.app.store.record_usage(&events).is_err() {
+            tracing::error!("Could not persist WebSocket turn usage");
         }
     }
     /// Records one upstream attempt. `error` must be a constant label from `attempt_error`.
@@ -404,6 +491,7 @@ impl RecordGuard {
             .as_ref()
             .is_some_and(|previous| *previous != c.id);
         self.last_connection = Some(c.id.clone());
+        self.upstream_model = Some(model.to_string());
         let Some(r) = &mut self.record else { return };
         if moved {
             r.failovers += 1;
@@ -424,6 +512,9 @@ impl RecordGuard {
     }
     /// The first body byte (or WebSocket frame) of the successful upstream response arrived.
     fn first_byte(&mut self) {
+        if let Some(turns) = &mut self.turns {
+            turns.first_byte();
+        }
         let ms = self.elapsed_ms();
         if let Some(r) = &mut self.record
             && self.timing_open
@@ -434,6 +525,9 @@ impl RecordGuard {
     }
     /// Notes the first non-empty output delta in `event`, if this is one.
     fn observe_output(&mut self, event: &Value) {
+        if let Some(turns) = &mut self.turns {
+            turns.output(event, is_output_delta(event));
+        }
         if !self.timing_open
             || self
                 .record
@@ -453,6 +547,9 @@ impl RecordGuard {
         self.timing_open = false;
     }
     fn attribute(&mut self, c: &Connection) {
+        self.provider = Some(usage::provider_for(c).into());
+        self.protocol = c.kind.clone();
+        self.billing = usage::billing_for_connection(c);
         if let Some(r) = &mut self.record {
             r.connection_id = c.id.clone();
             r.connection_name = c.name.clone();
@@ -464,11 +561,24 @@ impl RecordGuard {
             r.status = status;
             r.error = error.map(String::from);
         }
+        // WebSocket: the turn of the terminal frame just seen, or every open turn when the
+        // session itself ended, becomes a ledger unit now.
+        let closed = self.turns.as_mut().map(|t| t.close(status));
+        if let Some(closed) = closed {
+            self.record_turns(closed);
+        }
     }
     /// A new WebSocket turn starts: until it ends the session reads as in flight.
     fn reopen(&mut self) {
-        self.finish(499, Some("Client disconnected before completion"));
         self.settled = false;
+        if let Some(r) = &mut self.record {
+            r.status = 499;
+            r.error = Some("Client disconnected before completion".into());
+        }
+        let evicted = self.turns.as_mut().and_then(WsTurns::begin);
+        if let Some(t) = evicted {
+            self.record_turns(vec![t]);
+        }
     }
     fn id(&self) -> String {
         self.record
@@ -477,6 +587,11 @@ impl RecordGuard {
             .unwrap_or_default()
     }
     fn usage(&mut self, v: &Value) {
+        let hint = self.protocol.as_str();
+        match &mut self.turns {
+            Some(turns) => turns.frame(v, hint),
+            None => self.tokens.observe(v, hint),
+        }
         let u = v
             .get("usage")
             .or_else(|| v.get("response").and_then(|r| r.get("usage")))
@@ -501,7 +616,19 @@ impl Drop for RecordGuard {
         self.app.active.fetch_sub(1, Ordering::Relaxed);
         if let Some(mut r) = self.record.take() {
             r.latency_ms = self.start.elapsed().as_millis() as u64;
-            if self.app.store.record(&r).is_err() {
+            // HTTP/SSE: one ledger unit for the request. WebSocket: turns still open when the
+            // session ends (dropped without a final status) are written as cancelled units.
+            let status = if self.settled { r.status } else { 499 };
+            let closed = self.turns.as_mut().map(|t| t.close(status));
+            let cx = self.unit_context();
+            let units: Vec<_> = match closed {
+                None => vec![usage::event_for_record(&self.app.store, &r, &cx)],
+                Some(closed) => closed
+                    .into_iter()
+                    .map(|t| usage::event_for_turn(&self.app.store, &r, t, &cx))
+                    .collect(),
+            };
+            if self.app.store.record_with_usage(&r, &units).is_err() {
                 tracing::error!("Could not persist request metrics");
             }
             let _ = self.app.events.send(json!({"type":"request","data":r}));
@@ -517,6 +644,9 @@ fn permit(app: &App) -> Result<OwnedSemaphorePermit, ApiError> {
     })
 }
 fn compatible(c: &Connection, endpoint: &str) -> bool {
+    if c.kind == antigravity::KIND {
+        return antigravity::translate::supports(endpoint).is_some();
+    }
     match endpoint {
         "responses" | "chat/completions" => ["openai", "codex"].contains(&c.kind.as_str()),
         "messages" | "messages/count_tokens" => c.kind == "anthropic",
@@ -1550,26 +1680,92 @@ fn relay_stream(
 // HTTP endpoints
 // ---------------------------------------------------------------------------------------------
 
+/// Unwrap Cloud Code events before accounting and translating. A partial generation is never
+/// retried; duplicate terminals are consumed for usage only and never emitted twice.
+fn relay_antigravity(
+    mut guard: RecordGuard,
+    mut upstream: impl Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
+    mut translator: antigravity::translate::StreamTranslator,
+    redactor: Redactor,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+    async_stream::stream! {
+        let mut parser = antigravity::SseUnwrapper::new();
+        let mut complete = false;
+        loop {
+            let (events, eof) = match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    guard.first_byte();
+                    match parser.push(&bytes) {
+                        Ok(events) => (events, false),
+                        Err(_) => {
+                            guard.finish(502, Some("Oversized upstream event"));
+                            yield Ok(stream_error("Oversized upstream event. Output may be partial."));
+                            return;
+                        }
+                    }
+                }
+                Some(Err(_)) if complete => return,
+                Some(Err(_)) => {
+                    guard.finish(502, Some("Upstream stream interrupted"));
+                    yield Ok(stream_error("Upstream stream interrupted. Output may be partial; do not replay tool actions automatically."));
+                    return;
+                }
+                None => (parser.finish(), true),
+            };
+            for event in events {
+                guard.usage(&event);
+                if complete { continue; }
+                if event["error"].is_object() {
+                    let label = error_label(&event, &redactor);
+                    guard.finish(502, Some(&label));
+                    yield Ok(stream_error("Provider stream failed. Output may be partial."));
+                    return;
+                }
+                guard.observe_output(&event);
+                let chunks = translator.push(&event);
+                if chunks.iter().any(|chunk| chunk.len() > MAX_EVENT) {
+                    guard.finish(502, Some("Response exceeds 16 MiB"));
+                    yield Ok(stream_error("Response exceeds 16 MiB. Output may be partial."));
+                    return;
+                }
+                if translator.completed() {
+                    complete = true;
+                    guard.finish(200, None);
+                }
+                for chunk in chunks { yield Ok(chunk); }
+            }
+            if eof { break; }
+        }
+        if !complete {
+            guard.finish(502, Some("Provider stream ended without completion"));
+            yield Ok(stream_error("Provider stream ended without completion. Output may be partial."));
+        }
+    }
+}
+
 pub async fn responses(
     State(app): State<App>,
+    client: Option<Extension<ClientIdentity>>,
     h: HeaderMap,
     Json(v): Json<Value>,
 ) -> Result<Response, ApiError> {
-    execute(app, "responses", v, h).await
+    execute_as(app, "responses", v, h, client.map(|c| c.0)).await
 }
 pub async fn chat(
     State(app): State<App>,
+    client: Option<Extension<ClientIdentity>>,
     h: HeaderMap,
     Json(v): Json<Value>,
 ) -> Result<Response, ApiError> {
-    execute(app, "chat/completions", v, h).await
+    execute_as(app, "chat/completions", v, h, client.map(|c| c.0)).await
 }
 pub async fn messages(
     State(app): State<App>,
+    client: Option<Extension<ClientIdentity>>,
     h: HeaderMap,
     Json(v): Json<Value>,
 ) -> Result<Response, ApiError> {
-    execute(app, "messages", v, h).await
+    execute_as(app, "messages", v, h, client.map(|c| c.0)).await
 }
 /// Native Anthropic `POST /v1/messages/count_tokens`, used by Claude Code and the Anthropic
 /// SDKs. The request is shaped exactly like a message request for the same account (credential,
@@ -1640,6 +1836,7 @@ pub async fn count_tokens(
 }
 pub async fn gemini(
     State(app): State<App>,
+    client: Option<Extension<ClientIdentity>>,
     Path(action): Path<String>,
     h: HeaderMap,
     Json(mut v): Json<Value>,
@@ -1652,7 +1849,7 @@ pub async fn gemini(
     }
     v["model"] = json!(model);
     v["stream"] = json!(method == "streamGenerateContent");
-    execute(app, "gemini", v, h).await
+    execute_as(app, "gemini", v, h, client.map(|c| c.0)).await
 }
 
 /// The upstream URL and body for one account.
@@ -1846,11 +2043,24 @@ async fn collect(
     Ok(Collected::Value(response))
 }
 
+/// Runs an inference request from the admin dashboard playground (attributed to the
+/// `playground` client in usage).
 pub async fn execute(
     app: App,
     endpoint: &str,
     body: Value,
     h: HeaderMap,
+) -> Result<Response, ApiError> {
+    execute_as(app, endpoint, body, h, Some(ClientIdentity::playground())).await
+}
+
+/// Runs an inference request attributed (for usage accounting) to `client`.
+pub async fn execute_as(
+    app: App,
+    endpoint: &str,
+    body: Value,
+    h: HeaderMap,
+    client: Option<ClientIdentity>,
 ) -> Result<Response, ApiError> {
     let model = body["model"]
         .as_str()
@@ -1871,6 +2081,7 @@ pub async fn execute(
     let permit = permit(&app)?;
     let transport = if wants_stream { "sse" } else { "http" };
     let route = route_alias(&app, &model);
+    let session_client = client.as_ref().map(|c| c.id.clone());
     let mut guard = RecordGuard::new(
         app.clone(),
         &candidates[0].0,
@@ -1878,7 +2089,19 @@ pub async fn execute(
         transport,
         route,
         permit,
-    );
+    )
+    .with_client(client);
+    let mut h = h;
+    if candidates
+        .iter()
+        .any(|(c, _)| crate::usage::provider_for(c) == "opencode_go")
+    {
+        let session = go_session(&h, &body, session_client.as_deref().unwrap_or("playground"));
+        h.insert(
+            "x-opencode-session",
+            HeaderValue::from_str(&session).expect("hex session identifier"),
+        );
+    }
     let count = candidates.len();
     for (i, (mut c, target_model)) in candidates.into_iter().enumerate() {
         let last = i + 1 == count;
@@ -1894,7 +2117,40 @@ pub async fn execute(
             }
             return Err(e);
         }
-        let plan = plan_request(endpoint, &body, &c, &target_model, wants_stream);
+        let antigravity_plan = if c.kind == antigravity::KIND {
+            if let Err(error) = antigravity::ensure_project(&app, &mut c).await {
+                guard.attempt(
+                    &c,
+                    &target_model,
+                    0,
+                    ms_since(started),
+                    Some(attempt_error::CREDENTIAL_UNAVAILABLE),
+                );
+                guard.finish(error.status.as_u16(), Some("Provider project unavailable"));
+                if !last {
+                    continue;
+                }
+                return Err(error);
+            }
+            let protocol = antigravity::translate::supports(endpoint).expect("compatible endpoint");
+            let native =
+                antigravity::translate::plan(protocol, &body, &target_model, &c.account_id)
+                    .inspect_err(|error| {
+                        guard.finish(error.status.as_u16(), Some("Unsupported provider request"));
+                    })?;
+            Some((protocol, native))
+        } else {
+            None
+        };
+        let plan = if let Some((_, native)) = &antigravity_plan {
+            Plan {
+                url: antigravity::inference_url(&c.base_url, wants_stream),
+                payload: native.body.clone(),
+                chat_translate: false,
+            }
+        } else {
+            plan_request(endpoint, &body, &c, &target_model, wants_stream)
+        };
         let sent = send_with_auth_retry(
             &app,
             &mut c,
@@ -1940,7 +2196,9 @@ pub async fn execute(
             let headers = res.headers().clone();
             let error_body = read_json_bounded(res).await;
             let code = status.as_u16();
-            let retry = retry_seconds(&headers, &error_body, code);
+            let retry = antigravity::retry_after(&error_body)
+                .filter(|_| c.kind == antigravity::KIND)
+                .unwrap_or_else(|| retry_seconds(&headers, &error_body, code));
             if matches!(code, 401 | 403 | 429 | 502 | 503 | 504) {
                 cool_for_status(&app, &c.id, &target_model, code, retry);
                 if !last {
@@ -1964,6 +2222,27 @@ pub async fn execute(
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
+        if let Some((protocol, native)) = &antigravity_plan
+            && wants_stream
+        {
+            if !sse {
+                guard.finish(502, Some("Expected provider event stream"));
+                return Err(ApiError::upstream("Expected provider event stream"));
+            }
+            let translator = antigravity::translate::StreamTranslator::new(
+                *protocol,
+                &model,
+                native.placeholder_tools.clone(),
+            );
+            let stream = relay_antigravity(guard, res.bytes_stream(), translator, redactor);
+            return Ok(Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header("x-accel-buffering", "no")
+                .body(Body::from_stream(stream))
+                .expect("stream response"));
+        }
         if wants_stream && sse {
             let shape = if plan.chat_translate {
                 Shape::Chat(ChatTranslator::new(guard.id(), model.clone()))
@@ -1991,7 +2270,39 @@ pub async fn execute(
             Collected::Value(v) => v,
             Collected::Failed(response) => return Ok(response),
         };
-        guard.usage(&value);
+        let value = if let Some((protocol, native)) = &antigravity_plan {
+            let unwrapped = antigravity::unwrap(value);
+            guard.usage(&unwrapped);
+            if unwrapped["error"].is_object() {
+                guard.finish(502, Some("Provider returned an in-band error"));
+                return Ok(provider_error(
+                    StatusCode::BAD_GATEWAY,
+                    &unwrapped,
+                    &redactor,
+                    endpoint,
+                ));
+            }
+            if !antigravity::is_terminal(&unwrapped) {
+                guard.finish(502, Some("Provider returned an incomplete response"));
+                return Err(ApiError::upstream(
+                    "Provider returned an incomplete response",
+                ));
+            }
+            let translated = antigravity::translate::response(
+                *protocol,
+                unwrapped,
+                &model,
+                &native.placeholder_tools,
+            );
+            if serde_json::to_vec(&translated).is_ok_and(|v| v.len() > MAX_EVENT) {
+                guard.finish(502, Some("Response exceeds 16 MiB"));
+                return Err(ApiError::upstream("Response exceeds 16 MiB"));
+            }
+            translated
+        } else {
+            guard.usage(&value);
+            value
+        };
         if let Some(response_id) = value["id"].as_str() {
             remember_response(&app, response_id, &c.id);
         }
@@ -2017,13 +2328,15 @@ pub struct WsQuery {
 }
 pub async fn responses_ws(
     State(app): State<App>,
+    client: Option<Extension<ClientIdentity>>,
     h: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let permit = permit(&app)?;
+    let client = client.map(|c| c.0);
     Ok(ws
         .max_message_size(64 * 1024 * 1024)
-        .on_upgrade(move |socket| bridge(app, socket, h, None, permit)))
+        .on_upgrade(move |socket| bridge(app, socket, h, None, permit, client)))
 }
 pub async fn playground_ws(
     State(app): State<App>,
@@ -2037,7 +2350,16 @@ pub async fn playground_ws(
     let permit = permit(&app)?;
     Ok(ws
         .max_message_size(64 * 1024 * 1024)
-        .on_upgrade(move |socket| bridge(app, socket, h, q.model, permit)))
+        .on_upgrade(move |socket| {
+            bridge(
+                app,
+                socket,
+                h,
+                q.model,
+                permit,
+                Some(ClientIdentity::playground()),
+            )
+        }))
 }
 
 fn ws_error_frame(kind: &str, message: &str) -> AxMessage {
@@ -2245,6 +2567,7 @@ async fn bridge(
     h: HeaderMap,
     selected: Option<String>,
     permit: OwnedSemaphorePermit,
+    client: Option<ClientIdentity>,
 ) {
     let first = match first_text_frame(&mut socket).await {
         Ok(text) => text,
@@ -2274,7 +2597,8 @@ async fn bridge(
         return ws_error(&mut socket, message).await;
     }
     let route = route_alias(&app, &model);
-    let mut guard = RecordGuard::new(app.clone(), &cs[0].0, &model, "websocket", route, permit);
+    let mut guard = RecordGuard::new(app.clone(), &cs[0].0, &model, "websocket", route, permit)
+        .with_client(client);
     let Some((c, target, mut upstream)) = connect_upstream(&app, &h, cs, &mut guard).await else {
         guard.finish(502, Some("All upstream WebSocket handshakes failed"));
         return ws_error(
@@ -2511,6 +2835,50 @@ fn rewrite_ws(v: &mut Value, c: &Connection, target: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn go_conversation_identity_is_stable_private_and_client_scoped() {
+        let h = HeaderMap::new();
+        let a = json!({"messages":[{"role":"user","content":"PRIVATE-FIRST-PROMPT"}]});
+        let b = json!({"messages":[{"role":"user","content":"PRIVATE-FIRST-PROMPT"},{"role":"assistant","content":"ok"},{"role":"user","content":"another turn"}]});
+        let session = go_session(&h, &a, "client-a");
+        assert_eq!(session, go_session(&h, &b, "client-a"));
+        assert_ne!(session, go_session(&h, &a, "client-b"));
+        assert!(!session.contains("PRIVATE"));
+        let mut h = h;
+        h.insert(
+            "session_id",
+            HeaderValue::from_static("native-codex-session"),
+        );
+        assert_eq!(
+            go_session(&h, &a, "client-a"),
+            go_session(&h, &json!({"input":"partial continuation"}), "client-a")
+        );
+        assert!(!go_session(&h, &a, "client-a").contains("native-codex-session"));
+    }
+    #[test]
+    fn go_session_headers_are_not_forwarded_to_other_providers() {
+        let mut c: Connection = serde_json::from_value(json!({"id":"go","name":"Go","kind":"openai","base_url":"https://opencode.ai/zen/go/v1","enabled":true,"models":[],"supports_websocket":false,"created_at":""})).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-opencode-session", HeaderValue::from_static("sy-session"));
+        h.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-secret"),
+        );
+        h.insert("x-unrelated", HeaderValue::from_static("private"));
+        let headers = protocol_headers(&h, &c);
+        assert_eq!(headers["x-opencode-session"], "sy-session");
+        assert!(
+            headers["user-agent"]
+                .to_str()
+                .unwrap()
+                .starts_with("switchyard/")
+        );
+        assert!(!headers.contains_key("authorization"));
+        assert!(!headers.contains_key("x-unrelated"));
+        c.base_url = "https://api.openai.com/v1".into();
+        assert!(!protocol_headers(&h, &c).contains_key("x-opencode-session"));
+    }
+
     use super::*;
 
     #[test]

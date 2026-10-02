@@ -351,13 +351,19 @@ async fn client_auth(State(app): State<App>, request: Request, next: Next) -> Re
         })
         .unwrap_or("");
     let keys: Vec<Value> = app.store.list("key");
-    if !token.is_empty()
-        && keys.iter().any(|k| {
-            k["hash"]
+    if let Some(key) = keys.iter().find(|k| {
+        !token.is_empty()
+            && k["hash"]
                 .as_str()
                 .is_some_and(|x| constant_eq(x, &hash(token)))
-        })
-    {
+    }) {
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(crate::usage::ClientIdentity {
+                id: key["id"].as_str().unwrap_or_default().to_owned(),
+                name: key["name"].as_str().unwrap_or_default().to_owned(),
+            });
         next.run(request).await
     } else {
         ApiError::new(401, "A valid Switchyard client API key is required").into_response()
@@ -433,6 +439,8 @@ pub fn router(app: App) -> Router {
         .route("/api/keys/{id}", delete(delete_key))
         .route("/api/playground", post(playground))
         .route("/api/playground/ws", get(proxy::playground_ws))
+        .merge(crate::usage::router())
+        .merge(crate::usage_sources::router())
         .route_layer(middleware::from_fn_with_state(app.clone(), admin_auth));
     let client = Router::new()
         .route("/v1/models", get(client_models))
@@ -689,7 +697,7 @@ fn validate(v: &ConnectionInput) -> Result<(), ApiError> {
     if v.name.trim().is_empty() || v.name.len() > 100 {
         return Err(ApiError::bad("Connection name must be 1–100 characters"));
     }
-    if !["openai", "anthropic", "gemini", "codex"].contains(&v.kind.as_str()) {
+    if !["openai", "anthropic", "gemini", "codex", "antigravity"].contains(&v.kind.as_str()) {
         return Err(ApiError::bad("Unknown provider kind"));
     }
     let u = url::Url::parse(&v.base_url).map_err(|_| ApiError::bad("Invalid provider base URL"))?;
@@ -821,6 +829,24 @@ async fn test_connection(
         .await
         .map_err(management_error)?;
     let start = Instant::now();
+    if c.kind == crate::antigravity::KIND {
+        let result = tokio::time::timeout(
+            CATALOG_DEADLINE.min(app.timeout),
+            crate::antigravity::catalog(&app, &mut c),
+        )
+        .await;
+        let (status, message) = match result {
+            Ok(Ok(_)) => (200, "Provider reachable"),
+            Ok(Err(error)) => (
+                error.status.as_u16(),
+                "Provider unavailable; check credentials and account setup",
+            ),
+            Err(_) => (504, "Provider check timed out"),
+        };
+        return Ok(Json(
+            json!({"ok":status < 400,"status":status,"latency_ms":start.elapsed().as_millis(),"message":message}),
+        ));
+    }
     let path = if c.kind == "codex" {
         "models?client_version=0.159.3"
     } else {
@@ -1012,6 +1038,18 @@ async fn discover_models(
         .store
         .get::<Connection>("connection", &id)
         .ok_or(ApiError::new(404, "Connection not found"))?;
+    if connection.kind == crate::antigravity::KIND {
+        let catalog = tokio::time::timeout(
+            catalog_remaining(deadline)?,
+            crate::antigravity::catalog(&app, &mut connection),
+        )
+        .await
+        .map_err(|_| ApiError::new(504, CATALOG_UNAVAILABLE))?
+        .map_err(management_error)?;
+        return Ok(Json(
+            json!({"connection_id":id,"models":catalog.into_iter().map(|(id,name)|json!({"id":id,"name":name})).collect::<Vec<_>>()}),
+        ));
+    }
     tokio::time::timeout(
         catalog_remaining(deadline)?,
         credentials::refresh(&app, &mut connection),
@@ -1303,7 +1341,7 @@ async fn playground(State(app): State<App>, Json(v): Json<Value>) -> Result<Resp
             "messages",
             json!({"model":model,"max_tokens":1024,"messages":[{"role":"user","content":input}],"stream":stream}),
         ),
-        "gemini" => (
+        "gemini" | "antigravity" => (
             "gemini",
             json!({"model":model,"contents":[{"role":"user","parts":[{"text":input}]}],"stream":stream}),
         ),

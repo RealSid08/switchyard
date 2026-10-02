@@ -1,12 +1,14 @@
 # Account sign-in and credential lifecycle
 
-A Codex or Claude subscription account can be added in two ways. The difference is who owns the refresh token.
+A Codex, Claude or Antigravity subscription account can be added in two ways. The difference is who owns the refresh token.
 
 | `credential_source` | How it was added | Who refreshes it |
 | --- | --- | --- |
 | `oauth` | Browser sign-in started from Switchyard | Switchyard |
 | `native_codex` | Import of `$CODEX_HOME/auth.json` or `~/.codex/auth.json` | The Codex CLI |
 | `native_claude` | Import of `.credentials.json` in `$CLAUDE_CONFIG_DIR` or `~/.claude`, or the macOS Keychain record | Claude Code |
+| `native_agy` | Import of the Antigravity CLI file token | Antigravity CLI |
+| `native_opencode` | Read-only import of Zen or Go API keys | Not refreshed; key changes are adopted from the source |
 | `cliproxy` | Import of CLIProxyAPI auth files | CLIProxyAPI |
 | `api_key` | API key entered or imported | Never refreshed |
 
@@ -76,6 +78,14 @@ How it behaves:
 ### Switchyard on another machine
 
 The provider redirects the browser to `localhost` on the machine running the browser. When Switchyard runs elsewhere, the browser shows a connection error after you approve. Copy the full URL from the address bar and send it as `input` to `POST /api/oauth/{id}/callback`. Claude's manual `code#state` form is also accepted.
+
+## Antigravity Google sign-in
+
+Start with `POST /api/oauth/start {"provider":"antigravity"}`. Google uses PKCE, offline access and the fixed callback `http://localhost:51121/oauth-callback`. Remote clients can paste the callback URL using the same flow above.
+
+Switchyard needs the installed Antigravity OAuth client configuration. It reads that configuration from the app where supported, or accepts `SWITCHYARD_ANTIGRAVITY_CLIENT_ID` and `SWITCHYARD_ANTIGRAVITY_CLIENT_SECRET` in the server environment. These are never shown in the control room. Without them, importing an existing login still works; browser sign-in explains what is missing.
+
+`switchyard import antigravity` reads the CLI file fallback at `~/.gemini/antigravity-cli/antigravity-oauth-token`, or an explicit `--path`. It does not read the OS keyring. Google identity, project discovery, inference limitations and verification status are described in [providers](providers.md#antigravity).
 
 ## Refresh of browser sign-ins
 

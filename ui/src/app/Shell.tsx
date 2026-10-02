@@ -1,6 +1,7 @@
 import {
   Activity,
   FlaskConical,
+  Gauge,
   KeyRound,
   LayoutDashboard,
   Menu as MenuIcon,
@@ -42,6 +43,7 @@ export const NAV: NavItem[] = [
   { to: '/connections', label: 'Connections', icon: Plug },
   { to: '/routes', label: 'Routes', icon: Waypoints },
   { to: '/activity', label: 'Activity', icon: Activity },
+  { to: '/usage', label: 'Usage', icon: Gauge },
   { to: '/playground', label: 'Playground', icon: FlaskConical },
   { to: '/clients', label: 'Connect clients', icon: SquareTerminal },
   { to: '/keys', label: 'API keys', icon: KeyRound },

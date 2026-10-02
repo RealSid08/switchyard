@@ -208,6 +208,45 @@ for (const theme of THEMES) {
       c.assertClean();
     });
 
+    test(`usage, limits and pricing · ${vp} · ${theme}`, async ({ page }) => {
+      const c = watchConsole(page);
+      await mock('seed');
+      await setup(page, vp, theme);
+      await page.goto('/usage?window=7d');
+      await expect(page.locator('.usage-hero')).toBeVisible();
+      await shot(page, '50-usage-spend', vp, theme, { full: true });
+
+      await page.goto('/usage?window=7d&model=claude-opus-5-5');
+      await expect(page.locator('.usage-hero')).toBeVisible();
+      await shot(page, '51-usage-filtered', vp, theme, { full: false });
+
+      await page.goto('/usage?scope=external');
+      const codex = page.locator('.app-history li', { hasText: 'Codex CLI' });
+      await codex.getByRole('button', { name: 'Import' }).click();
+      await expect(codex).toContainText(/requests/, { timeout: 10_000 });
+      await page.reload();
+      await expect(page.locator('.usage-hero')).toBeVisible();
+      await shot(page, '52-usage-apps', vp, theme, { full: true });
+
+      await page.goto('/usage?scope=all');
+      await expect(page.getByRole('region', { name: 'Reported by apps' })).toBeVisible();
+      await shot(page, '53-usage-both', vp, theme, { full: true });
+
+      await page.goto('/usage/limits');
+      await expect(page.locator('.source-card').first()).toBeVisible();
+      await shot(page, '54-limits', vp, theme, { full: true });
+
+      await page.goto('/usage/limits?watch=1');
+      await expect(page.getByRole('dialog')).toBeVisible();
+      await shot(page, '55-watch-account', vp, theme, { full: false });
+      await page.keyboard.press('Escape');
+
+      await page.goto('/usage/pricing');
+      await expect(page.locator('.rates-table').first()).toBeVisible();
+      await shot(page, '56-pricing', vp, theme, { full: true });
+      c.assertClean();
+    });
+
     test(`gates and banners · ${vp} · ${theme}`, async ({ page }) => {
       await fetch(`${MOCK_TOKEN}/api/__mock/reset`, { method: 'POST' });
       await setup(page, vp, theme);

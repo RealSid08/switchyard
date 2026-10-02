@@ -2,6 +2,25 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-10-03
+
+### Added
+
+- Durable, idempotent usage accounting for HTTP, SSE and each Responses WebSocket turn, with individual and aggregate views by provider, account, client and model.
+- Token dimensions, public price cards and custom overrides; separate API estimates, subscription equivalents, unknown billing and provider-reported charges.
+- Live quota monitoring for connected Codex, Claude, OpenCode Go and Antigravity accounts, plus configurable Cursor monitoring and supported organization cost reports.
+- Bounded, incremental read-only Codex, Claude Code and OpenCode history imports with persistent checkpoints and explicit source coverage.
+- Native OpenCode Zen and Go credential imports and Antigravity Google sign-in, credential imports, project discovery and Chat, Messages and Gemini translation.
+- Usage control room, plan limits, pricing, import jobs and client setup guides designed with Claude Opus 5.5.
+- Authentication, retention, interruption, native import and quota regression coverage; third-party notices included in release archives.
+
+### Reliability
+
+- Permanent compact deduplication keys prevent old history imports from double-counting after raw-event retention.
+- Generation guards and queue handoff prevent removed or restarted imports from receiving stale writes.
+- Unknown native billing and request outcomes are retained as unknown. Historical account ownership is never inferred from the current login.
+- Unproven native/gateway overlap is presented as separate totals; estimated and reported charges are never added together.
+
 ## [0.1.0] - 2026-10-02
 
 Initial release.

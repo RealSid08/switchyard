@@ -26,7 +26,7 @@ enum Commands {
     TokenPath,
     /// Import a signed-in local CLI account without modifying its auth store.
     Import {
-        #[arg(value_parser=["codex","claude","cliproxy"])]
+        #[arg(value_parser=["codex","claude","cliproxy","opencode","opencode_go","antigravity"])]
         source: String,
         #[arg(long)]
         path: Option<String>,
@@ -115,6 +115,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::rename(&temporary, data.join("runtime.json"))?;
     tracing::info!(address=%listener.local_addr()?,"Switchyard ready. Open the dashboard in your browser.");
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    switchyard::usage_sources::set_antigravity_fetcher(|app, mut connection| {
+        Box::pin(async move {
+            switchyard::antigravity::fetch_quota(&app, &mut connection)
+                .await
+                .map(|quotas| {
+                    quotas
+                        .into_iter()
+                        .map(|quota| switchyard::usage_sources::ModelQuota {
+                            model: quota.model,
+                            label: quota.label,
+                            remaining_fraction: quota.remaining_fraction,
+                            reset_at: quota.reset_at,
+                        })
+                        .collect()
+                })
+                .map_err(|error| error.status.as_u16())
+        })
+    });
+    switchyard::usage_sources::start(&app);
     let server = axum::serve(listener, router(app))
         .with_graceful_shutdown(async {
             let _ = stop_rx.await;
