@@ -1046,3 +1046,147 @@ async fn connected_go_protocols_and_native_watcher_share_one_quota_read() {
     );
     assert!(m["id"].is_string());
 }
+
+async fn wait_native_idle(env: &Env) {
+    for _ in 0..200 {
+        let (_, v, _) = env.get("/api/usage/native").await;
+        if v["job"]["running"] == false {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("native job did not stop");
+}
+
+#[tokio::test]
+async fn cursor_watcher_changes_fence_inflight_history_and_stop_more_pages() {
+    for action in ["delete", "pause", "credentials"] {
+        let env = Env::start().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (begin, end) = (started.clone(), release.clone());
+        let up=Upstream::start(Router::new()
+            .route("/api/usage-summary",get(|| async { json_response(200,cursor_summary()) }))
+            .route("/api/dashboard/get-filtered-usage-events",axum::routing::post(move || {
+                let (begin,end)=(begin.clone(),end.clone());
+                async move {
+                    begin.notify_one();end.notified().await;
+                    json_response(200,json!({"totalUsageEventsCount":200,"usageEventsDisplay":
+                        (0..100).map(|n| json!({"timestamp":chrono::Utc::now().timestamp_millis()+n,"model":"composer","kind":"included_in_pro","chargedCents":1,"tokenUsage":{"inputTokens":100,"outputTokens":2,"cacheReadTokens":0,"cacheWriteTokens":0}})).collect::<Vec<_>>() }))
+                }
+            }))).await;
+        env.endpoint("cursor", &up);
+        let token = jwt(json!({"sub":"auth0|history-owner","exp":future()}));
+        let (code,m)=env.post("/api/usage/monitors",json!({"name":"Cursor","provider":"cursor","credential_source":"cookie","credential":token})).await;
+        assert_eq!(code, 200, "{m}");
+        let mid = m["id"].as_str().unwrap();
+        let source = format!("cursor:{mid}");
+        let (code, _) = env
+            .post("/api/usage/native/import", json!({"source":source}))
+            .await;
+        assert_eq!(code, 202);
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let path = format!("/api/usage/monitors/{mid}");
+        let (code,_) = match action {
+            "delete"=>env.send(reqwest::Method::DELETE,&path,json!({})).await,
+            "pause"=>env.send(reqwest::Method::PUT,&path,json!({"enabled":false})).await,
+            _=>env.send(reqwest::Method::PUT,&path,json!({"credential":jwt(json!({"sub":"auth0|different-owner","exp":future()}))})).await,
+        };
+        assert!((200..300).contains(&code), "{action}: {code}");
+        release.notify_waiters();
+        wait_native_idle(&env).await;
+        let (_, s, _) = env.get("/api/usage?window=24h&source=external").await;
+        assert_eq!(
+            s["totals"]["units"]["total"], 0,
+            "{action} wrote stale history"
+        );
+        let (_, status, _) = env.get("/api/usage/native").await;
+        assert!(
+            !status["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == source && s["enabled"] == true)
+        );
+        assert_eq!(
+            up.requests()
+                .iter()
+                .filter(|r| r.path.contains("get-filtered-usage-events"))
+                .count(),
+            1,
+            "{action} continued paging"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cursor_history_page_wait_uses_the_remaining_chunk_deadline() {
+    let env = Env::start().await; // App timeout is 2 seconds.
+    let release = Arc::new(tokio::sync::Notify::new());
+    let block = release.clone();
+    let up = Upstream::start(
+        Router::new()
+            .route(
+                "/api/usage-summary",
+                get(|| async { json_response(200, cursor_summary()) }),
+            )
+            .route(
+                "/api/dashboard/get-filtered-usage-events",
+                axum::routing::post(move || {
+                    let block = block.clone();
+                    async move {
+                        block.notified().await;
+                        json_response(200, json!({"usageEventsDisplay":[]}))
+                    }
+                }),
+            ),
+    )
+    .await;
+    env.endpoint("cursor", &up);
+    let (_,m)=env.post("/api/usage/monitors",json!({"name":"Cursor","provider":"cursor","credential_source":"cookie","credential":jwt(json!({"sub":"auth0|deadline-owner","exp":future()}))})).await;
+    let source = format!("cursor:{}", m["id"].as_str().unwrap());
+    env.post("/api/usage/native/import", json!({"source":source}))
+        .await;
+    let began = std::time::Instant::now();
+    let mut yielded = false;
+    while began.elapsed() < Duration::from_secs(3) {
+        let (_, v, _) = env.get("/api/usage/native").await;
+        if v["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == source && s["last_run_at"].is_string())
+        {
+            yielded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(yielded, "page request exceeded chunk/app deadline");
+    env.send(
+        reqwest::Method::DELETE,
+        &format!("/api/usage/native/{source}"),
+        json!({}),
+    )
+    .await;
+    release.notify_waiters();
+    wait_native_idle(&env).await;
+}
+
+#[test]
+fn cursor_included_allowance_and_ambiguous_metering_are_not_cash_invoices() {
+    for (kind, billing, reported, value) in [
+        ("included_in_pro", "subscription", None, Some(250_000)),
+        ("usage_based", "subscription", Some(250_000), None),
+        ("max_mode", "unknown", None, Some(250_000)),
+        ("unrecognized", "unknown", None, Some(250_000)),
+        ("own_api_key", "api_key", None, None),
+    ] {
+        let event=switchyard::native_usage::cursor_event(&json!({"timestamp":chrono::Utc::now().timestamp_millis(),"model":"composer","kind":kind,"chargedCents":25,"tokenUsage":{"inputTokens":1,"outputTokens":2}}),"account","Cursor").unwrap();
+        assert_eq!(event.billing, billing);
+        assert_eq!(event.reported_cost_micros, reported, "{kind}");
+        assert_eq!(event.estimated_cost_micros, value, "{kind}");
+    }
+}

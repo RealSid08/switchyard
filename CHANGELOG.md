@@ -2,6 +2,12 @@
 
 All notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-10-03
+
+- Cursor history jobs stop when their watcher is removed, paused or its credentials change; in-flight reads cannot restore deleted checkpoints or commit stale events.
+- Cursor page reads share one chunk deadline and retain completed pages when the next read times out.
+- Included Cursor allowance deductions are usage value, not billed cash. Only explicit on-demand events contribute reported charges; ambiguous billing stays unknown.
+
 ## [0.2.0] - 2026-10-03
 
 ### Added

@@ -633,7 +633,7 @@ pub fn record_external(store: &Store, items: &[ExternalUsage]) -> Result<usize, 
             apply_price(&mut e, &overrides);
             if let Some(amount) = x.estimated_cost_micros {
                 e.cost_micros = Some(amount);
-                e.pricing_version = Some(format!("native-sdk-estimate:{}", x.collector));
+                e.pricing_version = Some(format!("native-source-value:{}", x.collector));
                 e.unpriced_reason = None;
             }
             e
