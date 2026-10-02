@@ -68,6 +68,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   let active = 0;
   let cursor = 0;
   let trafficTimer: NodeJS.Timeout | null = null;
+  let generation = 0;
   let eventsEnabled = true;
   const eventSockets = new Set<WebSocket>();
 
@@ -195,6 +196,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
   }
 
   function reset() {
+    generation++;
     connections = [];
     routes = [];
     keys = [];
@@ -330,9 +332,14 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
           if (trafficTimer) clearInterval(trafficTimer);
           trafficTimer = null;
           break;
-        case 'burst':
-          if (connections.some((c) => c.enabled)) for (let i = 0; i < 25; i++) setTimeout(() => record(randomRequest()), i * 80);
+        case 'burst': {
+          const current = generation;
+          if (connections.some((c) => c.enabled)) for (let i = 0; i < 25; i++) setTimeout(() => {
+            // A later test may reset the fixture while this burst is queued.
+            if (generation === current && !paused && connections.some((c) => c.enabled)) record(randomRequest());
+          }, i * 80);
           break;
+        }
         case 'drop-events':
           for (const ws of eventSockets) ws.terminate();
           break;
@@ -576,6 +583,7 @@ export function createMockServer(opts: { auth?: 'cookie' | 'token'; seed?: boole
       for (const ws of eventSockets) ws.terminate();
       wss.close();
       server.close();
+      server.closeAllConnections();
     },
   };
 }
@@ -585,7 +593,15 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const portArg = args.includes('--port') ? args[args.indexOf('--port') + 1] : undefined;
   const port = Number(portArg ?? process.env.SWITCHYARD_MOCK_PORT ?? 5181);
   const auth = process.env.MOCK_AUTH === 'token' ? 'token' : 'cookie';
-  const { server } = createMockServer({ seed: args.includes('--seed'), auth });
+  const mockServer = createMockServer({ seed: args.includes('--seed'), auth });
+  const { server } = mockServer;
+  // Exit promptly on SIGTERM/SIGINT even with open sockets or keep-alive connections.
+  const shutdown = () => {
+    mockServer.close();
+    setTimeout(() => process.exit(0), 500).unref();
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
   server.listen(port, '127.0.0.1', () => {
     console.log(`Switchyard mock backend on http://127.0.0.1:${port} (auth: ${auth}${auth === 'token' ? `, token ${ADMIN_TOKEN}` : ''})`);
   });

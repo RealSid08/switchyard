@@ -16,3 +16,7 @@ updates:
   - package-ecosystem: docker
     directory: /
     schedule: { interval: weekly }
+    ignore:
+      # Keep the container on the project's active Node LTS major.
+      - dependency-name: node
+        update-types: ['version-update:semver-major']
