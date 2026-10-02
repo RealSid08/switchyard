@@ -7,6 +7,7 @@
 //! by CLIProxyAPI's `internal/auth/{codex,claude}` (MIT), used as the behavioral reference. The
 //! callback ports are fixed because the providers only accept these registered redirect URIs.
 use crate::{
+    antigravity,
     app::{ApiError, App},
     credentials::{self, Parsed, SOURCE_OAUTH},
     store::Connection,
@@ -62,10 +63,24 @@ static CLAUDE: Provider = Provider {
     callback_path: "/callback",
     port: 54545,
 };
+/// Google sign-in for Antigravity. The client id and secret are resolved at runtime
+/// ([`antigravity::oauth_client`]); `client_id` here is unused.
+static ANTIGRAVITY: Provider = Provider {
+    key: "antigravity",
+    auth_url: antigravity::AUTH_URL,
+    token_url: antigravity::TOKEN_URL,
+    profile_url: antigravity::USERINFO_URL,
+    client_id: "",
+    scope: antigravity::SCOPES,
+    refresh_scope: "",
+    callback_path: antigravity::CALLBACK_PATH,
+    port: antigravity::CALLBACK_PORT,
+};
 fn provider(name: &str) -> Option<&'static Provider> {
     match name.trim().to_ascii_lowercase().as_str() {
         "codex" | "openai" | "chatgpt" => Some(&CODEX),
         "claude" | "anthropic" => Some(&CLAUDE),
+        "antigravity" => Some(&ANTIGRAVITY),
         _ => None,
     }
 }
@@ -261,7 +276,13 @@ async fn bind(port: u16) -> Result<Vec<TcpListener>, ApiError> {
 /// Starts a browser sign-in. Returns `{id, provider, authorization_url, expires_in_seconds,
 /// status:"pending"}`. Open `authorization_url` in a browser on this machine.
 pub async fn start(app: App, provider_name: &str) -> Result<Value, ApiError> {
-    let p = provider(provider_name).ok_or(ApiError::bad("Choose codex or claude"))?;
+    let p = provider(provider_name).ok_or(ApiError::bad("Choose codex, claude or antigravity"))?;
+    // Antigravity needs the desktop app's OAuth client, resolved before anything is bound.
+    let google_client = if p.key == ANTIGRAVITY.key {
+        Some(antigravity::oauth_client().ok_or(ApiError::new(424, antigravity::CLIENT_MISSING))?)
+    } else {
+        None
+    };
     {
         let mut flows = FLOWS.lock().expect("oauth flows");
         prune(&mut flows);
@@ -306,13 +327,22 @@ pub async fn start(app: App, provider_name: &str) -> Result<Value, ApiError> {
         if p.key == "claude" {
             q.append_pair("code", "true");
         }
-        q.append_pair("client_id", p.client_id)
-            .append_pair("response_type", "code")
-            .append_pair("redirect_uri", &redirect_uri)
-            .append_pair("scope", p.scope)
-            .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("state", &state);
+        q.append_pair(
+            "client_id",
+            google_client
+                .as_ref()
+                .map_or(p.client_id, |c| c.id.as_str()),
+        )
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", p.scope)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &state);
+        if p.key == ANTIGRAVITY.key {
+            q.append_pair("access_type", "offline")
+                .append_pair("prompt", "consent");
+        }
         if p.key == "codex" {
             q.append_pair("prompt", "login")
                 .append_pair("id_token_add_organizations", "true")
@@ -633,6 +663,7 @@ const UNREACHABLE: &str =
     "Could not reach the provider sign-in service. Check the network and start again.";
 const REJECTED: &str = "The provider rejected this sign-in. Start again from the control room.";
 const BAD_RESPONSE: &str = "The provider returned an unexpected sign-in response. Start again.";
+const UNCONFIGURED: &str = antigravity::CLIENT_MISSING;
 
 async fn exchange(
     app: &App,
@@ -648,7 +679,21 @@ async fn exchange(
         .post(token_url(p))
         .timeout(credentials::token_timeout())
         .header(header::ACCEPT, "application/json");
-    let req = if p.key == "codex" {
+    let google_client = if p.key == ANTIGRAVITY.key {
+        Some(antigravity::oauth_client().ok_or(UNCONFIGURED)?)
+    } else {
+        None
+    };
+    let req = if let Some(client) = &google_client {
+        req.form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client.id.as_str()),
+            ("client_secret", client.secret.as_str()),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier),
+        ])
+    } else if p.key == "codex" {
         req.form(&[
             ("grant_type", "authorization_code"),
             ("client_id", p.client_id),
@@ -682,6 +727,45 @@ async fn exchange(
         .filter(|s| !s.is_empty())
         .ok_or(BAD_RESPONSE)?;
     let refresh = v["refresh_token"].as_str().unwrap_or("");
+    if p.key == ANTIGRAVITY.key {
+        if refresh.is_empty() {
+            // Without offline access the account could not be renewed; refuse rather than save
+            // an account that stops working within the hour.
+            return Err(BAD_RESPONSE);
+        }
+        let email = antigravity::fetch_email(app, access)
+            .await
+            .unwrap_or_default();
+        let project = antigravity::discover_project(app, access)
+            .await
+            .unwrap_or_default();
+        let models = antigravity::fetch_models(app, access, &project)
+            .await
+            .map(|m| m.into_iter().map(|(id, _)| id).collect())
+            .unwrap_or_else(antigravity::default_models);
+        return Ok(Parsed {
+            name: if email.is_empty() {
+                "Antigravity account".into()
+            } else {
+                email.clone()
+            },
+            kind: antigravity::KIND,
+            base: antigravity::DAILY_BASE,
+            token: access.into(),
+            refresh_token: refresh.into(),
+            expires_at: credentials::expiry_from_response(&v, access),
+            account_id: project,
+            identity: if email.is_empty() {
+                crate::store::hash(&format!("v1|antigravity|oauth|{flow_id}"))
+            } else {
+                antigravity::identity_for_email(&email)
+            },
+            source: SOURCE_OAUTH,
+            source_path: String::new(),
+            oauth: true,
+            models,
+        });
+    }
     let mut parsed = if p.key == "codex" {
         credentials::codex_from_tokens(
             &json!({"refresh_token": refresh, "id_token": v["id_token"]}),
@@ -762,6 +846,7 @@ pub(crate) async fn refresh_tokens(
     let p: &Provider = match kind {
         "codex" => &CODEX,
         "anthropic" => &CLAUDE,
+        antigravity::KIND => &ANTIGRAVITY,
         _ => {
             return Err(ApiError::new(
                 401,
@@ -774,7 +859,16 @@ pub(crate) async fn refresh_tokens(
         .post(token_url(p))
         .timeout(credentials::token_timeout())
         .header(header::ACCEPT, "application/json");
-    let req = if p.key == "codex" {
+    let req = if p.key == ANTIGRAVITY.key {
+        let client =
+            antigravity::oauth_client().ok_or(ApiError::new(401, antigravity::CLIENT_MISSING))?;
+        req.form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client.id.as_str()),
+            ("client_secret", client.secret.as_str()),
+        ])
+    } else if p.key == "codex" {
         req.form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),

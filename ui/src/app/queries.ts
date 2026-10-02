@@ -3,6 +3,8 @@ import { ApiError } from '../lib/api';
 import { api } from '../lib/client';
 import { outcome } from '../lib/format';
 import { mergeRequests } from '../lib/requests';
+import type { UsageQuery, UsageSources } from '../lib/usageTypes';
+import type { ImportSource } from '../lib/types';
 import type { ApiKey, Connection, ConnectionInput, Overview, RequestRecord, Route, RouteStrategy, RouteTarget } from '../lib/types';
 import { useLiveStatus } from './live';
 
@@ -13,6 +15,11 @@ export const qk = {
   routes: ['routes'] as const,
   requests: (f: RequestQuery) => ['requests', f] as const,
   keys: ['keys'] as const,
+  usage: (q: UsageQuery) => ['usage', q] as const,
+  pricing: ['usage-pricing'] as const,
+  sources: ['usage-sources'] as const,
+  monitors: ['usage-monitors'] as const,
+  native: ['usage-native'] as const,
   config: ['config'] as const,
 };
 
@@ -178,7 +185,7 @@ export function useTestConnection() {
 export function useImport() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ source, path }: { source: 'codex' | 'claude' | 'cliproxy'; path?: string }) => api.importCredentials(source, path),
+    mutationFn: ({ source, path }: { source: ImportSource; path?: string }) => api.importCredentials(source, path),
     onSettled: () => invalidateTopology(qc),
   });
 }
@@ -274,4 +281,67 @@ export function applyRequestEvent(qc: QueryClient, record: RequestRecord) {
   qc.setQueryData<Overview>(qk.overview, (o) =>
     o ? { ...o, recent_requests: mergeRequests(o.recent_requests, [record], Math.max(20, o.recent_requests.length)) } : o,
   );
+}
+
+/* ---------- Usage ---------- */
+
+/** Usage report; refreshes every minute while visible, keeps the last report while a new filter loads. */
+export function useUsage(q: UsageQuery, opts: { enabled?: boolean } = {}) {
+  return useQuery({
+    enabled: opts.enabled ?? true,
+    queryKey: qk.usage(q),
+    queryFn: ({ signal }) => api.usage(q, signal),
+    refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
+    retry: (count, err) => !(err instanceof ApiError && (err.status === 400 || err.isUnsupported)) && count < 2,
+  });
+}
+
+export function usePricing() {
+  return useQuery({ queryKey: qk.pricing, queryFn: api.pricing, staleTime: 5 * 60_000, retry: (n, e) => !(e instanceof ApiError && e.isUnsupported) && n < 2 });
+}
+
+/** Sources poll faster while a refresh is running so results land without a reload. */
+export function useUsageSources() {
+  return useQuery({
+    queryKey: qk.sources,
+    queryFn: api.usageSources,
+    refetchInterval: (query) => (query.state.data?.refreshing || query.state.data?.sources.some((s) => s.status === 'refreshing' || s.refreshing) ? 3000 : 60_000),
+    retry: (n, e) => !(e instanceof ApiError && e.isUnsupported) && n < 2,
+  });
+}
+
+export function useMonitors() {
+  return useQuery({ queryKey: qk.monitors, queryFn: api.monitors, retry: (n, e) => !(e instanceof ApiError && e.isUnsupported) && n < 2 });
+}
+
+export function useRefreshUsage() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id?: string) => api.refreshUsage(id),
+    onSuccess: (_r, id) => {
+      // Optimistically show "Refreshing" until the next poll confirms.
+      qc.setQueryData<UsageSources>(qk.sources, (d) =>
+        d ? { ...d, refreshing: true, sources: d.sources.map((s) => (!id || s.id === id ? { ...s, refreshing: true } : s)) } : d,
+      );
+      void qc.invalidateQueries({ queryKey: qk.sources });
+    },
+  });
+}
+
+export function invalidateUsage(qc: QueryClient) {
+  void qc.invalidateQueries({ queryKey: ['usage'] });
+  void qc.invalidateQueries({ queryKey: qk.sources });
+  void qc.invalidateQueries({ queryKey: qk.monitors });
+}
+
+/** Native app histories (OpenCode, Codex CLI, Claude Code, Cursor). Polls quickly while an import runs. */
+export function useNativeHistory(opts: { enabled?: boolean } = {}) {
+  return useQuery({
+    enabled: opts.enabled ?? true,
+    queryKey: qk.native,
+    queryFn: api.nativeHistory,
+    refetchInterval: (query) => (query.state.data?.running ? 2000 : 60_000),
+    retry: (n, e) => !(e instanceof ApiError && e.isUnsupported) && n < 2,
+  });
 }

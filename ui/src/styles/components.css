@@ -1155,6 +1155,8 @@ dialog.dialog.sheet .dialog-body {
 
 /* ---------- Tables ---------- */
 .table-wrap {
+  /* Contains absolutely positioned screen-reader text, so it scrolls with the table instead of widening the page. */
+  position: relative;
   overflow-x: auto;
   min-width: 0;
 }
@@ -1552,4 +1554,36 @@ table.table {
   border-radius: 3px;
   background: var(--chart-primary);
   transition: width var(--dur-slow) var(--ease);
+}
+
+.kind-antigravity {
+  --kind-fg: #b392ff;
+  --kind-bg: rgb(179 146 255 / 0.12);
+}
+
+.kind-cursor {
+  --kind-fg: #d8dde4;
+  --kind-bg: rgb(216 221 228 / 0.08);
+}
+
+.kind-opencode {
+  --kind-fg: #f0c674;
+  --kind-bg: rgb(240 198 116 / 0.1);
+}
+
+.kind-other {
+  --kind-fg: var(--text-2);
+  --kind-bg: var(--surface-3);
+}
+
+[data-theme='light'] .kind-antigravity {
+  --kind-fg: #6237c4;
+}
+
+[data-theme='light'] .kind-cursor {
+  --kind-fg: #2b3138;
+}
+
+[data-theme='light'] .kind-opencode {
+  --kind-fg: #7a5200;
 }

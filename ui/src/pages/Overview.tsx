@@ -11,6 +11,7 @@ import { formatCompact, formatDuration, formatMs, formatNumber, formatPercent, f
 import { resolveGatewayUrls } from '../lib/snippets';
 import type { Overview, Transport } from '../lib/types';
 import { ConnectOptions } from './connections/ImportPanel';
+import { UsageGlance } from './usage/UsageGlance';
 import { HealthChip } from './Connections';
 
 export function OverviewPage() {
@@ -55,6 +56,7 @@ export function OverviewPage() {
       />
       {!setupDone ? <SetupStrip steps={steps} /> : null}
       <Kpis o={o} />
+      <UsageGlance />
       <div className="overview-grid">
         <TrafficCard o={o} />
         <TransportCard o={o} />

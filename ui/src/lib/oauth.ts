@@ -2,7 +2,7 @@ import { ApiError } from './api';
 import type { Connection, OAuthFlow, OAuthProvider } from './types';
 
 /** Fixed loopback callback ports the gateway listens on during a sign-in. */
-export const CALLBACK_PORTS: Record<OAuthProvider, number> = { codex: 1455, claude: 54545 };
+export const CALLBACK_PORTS: Record<OAuthProvider, number> = { codex: 1455, claude: 54545, antigravity: 51121 };
 
 export const PROVIDER_COPY: Record<OAuthProvider, { name: string; account: string; cli: string; example: string }> = {
   codex: {
@@ -16,6 +16,12 @@ export const PROVIDER_COPY: Record<OAuthProvider, { name: string; account: strin
     account: 'Claude account (Claude Code)',
     cli: 'Claude Code',
     example: 'http://localhost:54545/callback?code=…&state=…  or  code#state',
+  },
+  antigravity: {
+    name: 'Google',
+    account: 'Antigravity account (Google)',
+    cli: 'Antigravity',
+    example: 'http://localhost:51121/oauth-callback?code=…&state=…',
   },
 };
 
@@ -277,6 +283,10 @@ export function credentialSourceInfo(source: string | undefined | null): { label
       return { label: 'Codex CLI login', detail: 'Follows your Codex CLI login. Switchyard never refreshes it; if it expires, run codex login, then re-import.', owner: 'source' };
     case 'native_claude':
       return { label: 'Claude Code login', detail: 'Follows your Claude Code login. Switchyard never refreshes it; if it expires, sign in to Claude Code again, then re-import.', owner: 'source' };
+    case 'native_antigravity':
+      return { label: 'Antigravity login', detail: 'Follows the Antigravity CLI login it was imported from. Switchyard never refreshes it; sign in to Antigravity again, then re-import.', owner: 'source' };
+    case 'native_opencode':
+      return { label: 'OpenCode key', detail: 'An OpenCode Zen or Go key imported read-only from OpenCode. Re-import if you change it in OpenCode.', owner: 'source' };
     case 'cliproxy':
       return { label: 'CLIProxyAPI account', detail: 'Follows the CLIProxyAPI auth file it was imported from. Re-import after that login changes.', owner: 'source' };
     case 'api_key':
@@ -288,7 +298,7 @@ export function credentialSourceInfo(source: string | undefined | null): { label
 
 /** Which browser sign-in provider can (re)authenticate this connection kind. */
 export function oauthProviderFor(kind: string): OAuthProvider | null {
-  return kind === 'codex' ? 'codex' : kind === 'anthropic' ? 'claude' : null;
+  return kind === 'codex' ? 'codex' : kind === 'anthropic' ? 'claude' : kind === 'antigravity' ? 'antigravity' : null;
 }
 
 export function formatCountdown(seconds: number | null): string {

@@ -115,9 +115,39 @@ wire_api = "responses"
 
 **Claude Code.** Set `ANTHROPIC_BASE_URL=http://127.0.0.1:7410` and `ANTHROPIC_API_KEY=$SWITCHYARD_API_KEY`, and choose a model that a Claude connection or route provides.
 
-**OpenCode and other OpenAI-compatible tools.** Configure a custom OpenAI-compatible provider with base URL `http://127.0.0.1:7410/v1`, your client key and a configured model.
+## OpenCode
 
-**T3 Code.** Use a provider adapter that accepts a custom API base URL. Do not change T3 Code's existing account or runtime settings to point at Switchyard.
+Add a custom provider to your OpenCode configuration:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "switchyard": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Switchyard",
+      "options": {
+        "baseURL": "http://127.0.0.1:7410/v1",
+        "apiKey": "{env:SWITCHYARD_API_KEY}"
+      },
+      "models": { "deepseek-v4-flash": { "name": "DeepSeek via Switchyard" } }
+    }
+  },
+  "model": "switchyard/deepseek-v4-flash"
+}
+```
+
+Choose a model served by your connection or route. For native Responses semantics use the OpenAI SDK provider; for Messages use the Anthropic SDK provider and its base URL. Importing Zen/Go credentials into Switchyard and configuring OpenCode as a gateway client are separate steps. See [providers](providers.md#opencode-zen-and-go).
+
+## Cursor
+
+Under Models, enable your OpenAI API key and use a Switchyard client key. Enable **Override OpenAI Base URL** and enter the gateway's reachable HTTPS `/v1` URL. Add a compatible model served by that connection or route.
+
+Cursor's servers send BYOK requests. A loopback address on your machine is unreachable from those servers. Configure a secured externally reachable HTTPS endpoint before using the override. This integration applies to supported chat models; it does not replace Cursor Tab or expose Composer as a Switchyard provider. Native Cursor end-to-end verification remains pending account and endpoint access.
+
+## T3 Code
+
+Use a provider adapter that accepts a custom API base URL. Do not change T3 Code's existing account or runtime settings to point at Switchyard.
 
 These client settings come from each tool's documentation and can change between versions; check the tool's current docs if a setting is rejected.
 
@@ -127,4 +157,4 @@ If Switchyard runs on another machine, put it behind TLS (or a private network s
 
 ## Verification
 
-Codex CLI 0.160.0 was exercised against Switchyard with an isolated `CODEX_HOME`, a client key, and the custom Responses provider above. Live Codex subscription requests passed HTTP, SSE, Chat translation, function calls, and two WebSocket turns including a continuation. Claude Code subscription imports passed native Messages JSON, SSE, and automatic tool selection with Opus 5.5. Claude Code CLI was also exercised through the gateway, with isolated configuration, native streaming, and tool use. Native auth stores were not modified. SDK examples and Gemini live access remain unverified.
+Codex CLI 0.160.0 was exercised against Switchyard with an isolated `CODEX_HOME`, a client key, and the custom Responses provider above. Live Codex subscription requests passed HTTP, SSE, Chat translation, function calls, and two WebSocket turns including a continuation. Claude Code subscription imports passed native Messages JSON, SSE, and automatic tool selection with Opus 5.5. Claude Code CLI was also exercised through the gateway, with isolated configuration, native streaming, and tool use. Native auth stores were not modified. The OpenAI Python SDK stream and a two-turn Responses WebSocket continuation were also verified on v0.2. OpenCode 2.0.21 completed an isolated read-tool request through Switchyard to Go. The v0.2 Claude SDK probe returned the account's current rate limit; its live recheck awaits reset. Gemini SDK live access and Cursor/Antigravity live access remain unverified.

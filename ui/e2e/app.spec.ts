@@ -518,6 +518,8 @@ test('model discovery: rejected credential is explained without signing out', as
 
 async function firstConnectionId(page: import('@playwright/test').Page, name: string) {
   await page.goto('/connections');
+  // The page's own requests establish the admin session before we call the API directly.
+  await expect(page.locator('.conn-card').first()).toBeVisible();
   return page.evaluate(async (n) => {
     const list = (await (await fetch('/api/connections')).json()) as { id: string; name: string }[];
     return list.find((c) => c.name === n)?.id ?? '';

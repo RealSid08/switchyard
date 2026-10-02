@@ -1,4 +1,4 @@
-import { CornerDownLeft, KeyRound, Moon, Pause, Play, Plug, Plus, Search, Settings, Sun, Waypoints, type LucideIcon } from 'lucide-react';
+import { CornerDownLeft, Gauge, KeyRound, Moon, Pause, Play, Plug, Plus, Search, Settings, Sun, Waypoints, type LucideIcon } from 'lucide-react';
 import { useMemo, useState, type KeyboardEvent } from 'react';
 import { Dialog } from '../components/Dialog';
 import { useOverview, useRoutes, useModels } from './queries';
@@ -58,6 +58,9 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
       { id: 'import', label: 'Import Codex or Claude login', hint: 'Action', icon: Plug, run: go('/connections?import=1'), keywords: 'credentials cliproxy' },
       { id: 'new-route', label: 'Create a model route', hint: 'Action', icon: Waypoints, run: go('/routes?new=1') },
       { id: 'new-key', label: 'Create a client key', hint: 'Action', icon: KeyRound, run: go('/keys?new=1') },
+      { id: 'limits', label: 'Plan limits and balances', hint: 'Go to', icon: Gauge, run: go('/usage/limits'), keywords: 'quota usage cursor opencode antigravity' },
+      { id: 'pricing', label: 'Model prices', hint: 'Go to', icon: Gauge, run: go('/usage/pricing'), keywords: 'cost price override' },
+      { id: 'watch', label: 'Watch an account’s usage', hint: 'Action', icon: Gauge, run: go('/usage/limits?watch=1'), keywords: 'cursor opencode monitor import' },
       {
         id: 'theme',
         label: `Switch to ${resolved === 'dark' ? 'light' : 'dark'} theme`,

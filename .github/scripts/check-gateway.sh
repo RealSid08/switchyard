@@ -35,6 +35,14 @@ curl --fail --silent "$base/connections" | grep -q 'id="root"' || fail "SPA fall
 [ "$(code "$base/api/connections" -H "Authorization: Bearer $token")" = 200 ] || fail "admin token rejected"
 [ "$(code "$base/api/connections" -H "Authorization: Bearer $token" -H 'Origin: https://evil.example')" = 403 ] || fail "cross-origin admin accepted"
 
+# Usage and billing metadata belong to the admin API, including on fresh installs.
+for endpoint in '/api/usage?window=24h' /api/usage/pricing /api/usage/sources /api/usage/monitors; do
+  [ "$(code "$base$endpoint")" = 401 ] || fail "usage API exposed without credentials: $endpoint"
+  [ "$(code "$base$endpoint" -H "Authorization: Bearer $token")" = 200 ] || fail "usage API unavailable: $endpoint"
+  [ "$(code "$base$endpoint" -H "Authorization: Bearer $token" -H 'Origin: https://evil.example')" = 403 ] || fail "cross-origin usage API accepted: $endpoint"
+done
+[ "$(code "$base/api/usage?window=invalid" -H "Authorization: Bearer $token")" = 400 ] || fail "invalid usage window accepted"
+
 # Token session, then logout revokes it.
 curl --fail --silent --dump-header "$headers" -X POST "$base/api/session" -H "Authorization: Bearer $token" > /dev/null
 cookie=$(grep -i '^set-cookie: sy_session=' "$headers" | head -n1 | sed -E 's/^[^:]+: *//; s/;.*$//' | tr -d '\r')

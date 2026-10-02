@@ -24,6 +24,18 @@ const HINTS: Record<ImportSource, string> = {
   codex: 'Sign in on the gateway machine with `codex login`, then import again.',
   claude: 'Sign in on the gateway machine with `claude` (then /login), then import again.',
   cliproxy: 'Point at a CLIProxyAPI auth .json file or its auth directory on the gateway machine.',
+  antigravity: 'Sign in with the Antigravity CLI on the gateway machine, then import again. Or use Sign in.',
+  opencode: 'Add a Zen or Go key in OpenCode on the gateway machine (opencode auth), then import again.',
+  opencode_go: 'Add a Go key in OpenCode on the gateway machine (opencode auth), then import again.',
+};
+
+const SOURCE_LABEL: Record<ImportSource, string> = {
+  codex: 'Codex',
+  claude: 'Claude Code',
+  cliproxy: 'CLIProxyAPI',
+  antigravity: 'Antigravity',
+  opencode: 'OpenCode',
+  opencode_go: 'OpenCode Go',
 };
 
 /** Shared import action: classifies results as added vs refreshed for multi-account clarity. */
@@ -112,7 +124,7 @@ export function ConnectOptions({ apiProviders = true }: { apiProviders?: boolean
     if (o.error) return;
     toast({
       tone: 'ok',
-      title: `${source === 'codex' ? 'Codex' : source === 'claude' ? 'Claude Code' : 'CLIProxyAPI'} import complete`,
+      title: `${SOURCE_LABEL[source]} import complete`,
       message: `${describeImport(o)} Original credential files were not modified.`,
     });
   };
@@ -127,40 +139,45 @@ export function ConnectOptions({ apiProviders = true }: { apiProviders?: boolean
     void go('cliproxy', path.trim());
   };
 
-  const accounts: { provider: OAuthProvider; source: ImportSource; kind: string; title: string; sub: string; cli: string }[] = [
+  const accounts: { provider: OAuthProvider | null; source: ImportSource; kind: string; title: string; sub: string; cli: string; importLabel?: string }[] = [
     { provider: 'codex', source: 'codex', kind: 'codex', title: 'ChatGPT', sub: 'Codex subscription', cli: 'Codex CLI' },
     { provider: 'claude', source: 'claude', kind: 'anthropic', title: 'Claude', sub: 'Claude Pro or Max subscription', cli: 'Claude Code' },
+    { provider: 'antigravity', source: 'antigravity', kind: 'antigravity', title: 'Antigravity', sub: 'Google account with Antigravity', cli: 'Antigravity CLI' },
+    // OpenCode uses API keys, so there's no browser sign-in: import the keys OpenCode saved.
+    { provider: null, source: 'opencode', kind: 'opencode', title: 'OpenCode Zen and Go', sub: 'Keys saved by OpenCode on this machine', cli: 'OpenCode', importLabel: 'Import OpenCode keys' },
   ];
 
   return (
     <div className="stack">
       <ul className="account-rows" aria-label="Subscription accounts">
         {accounts.map((a) => (
-          <li key={a.provider} className="account-row">
+          <li key={a.source} className="account-row">
             <KindMark kind={a.kind} size="lg" />
             <div className="account-row-text">
               <span className="account-row-title">{a.title}</span>
               <span className="muted small">{a.sub}</span>
             </div>
             <div className="account-row-actions">
-              <Button
-                variant="primary"
-                icon={LogIn}
-                onClick={() => setSignIn(a.provider)}
-                disabled={!!pending}
-                aria-label={`Sign in with ${a.title} in the browser`}
-                data-autofocus={a.provider === 'codex' ? true : undefined}
-              >
-                Sign in
-              </Button>
+              {a.provider ? (
+                <Button
+                  variant="primary"
+                  icon={LogIn}
+                  onClick={() => setSignIn(a.provider)}
+                  disabled={!!pending}
+                  aria-label={`Sign in with ${a.title} in the browser`}
+                  data-autofocus={a.provider === 'codex' ? true : undefined}
+                >
+                  Sign in
+                </Button>
+              ) : null}
               <Button
                 icon={Download}
                 onClick={() => go(a.source)}
                 loading={pending === a.source}
                 disabled={!!pending && pending !== a.source}
-                aria-label={`Import ${a.cli} login`}
+                aria-label={a.importLabel ?? `Import ${a.cli} login`}
               >
-                Import {a.cli}
+                {a.importLabel ?? `Import ${a.cli}`}
               </Button>
             </div>
           </li>

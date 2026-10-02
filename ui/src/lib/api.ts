@@ -17,6 +17,18 @@ import type {
   RouteStrategy,
   RouteTarget,
 } from './types';
+import type {
+  MonitorInput,
+  PriceOverride,
+  PricingTable,
+  UsageImportProvider,
+  UsageImportResult,
+  UsageMonitor,
+  UsageQuery,
+  UsageReport,
+  UsageSources,
+} from './usageTypes';
+import { normalizeNative } from './usage';
 
 export type ApiErrorKind = 'network' | 'http' | 'aborted' | 'parse';
 
@@ -223,6 +235,29 @@ export function createApiClient(opts: ApiClientOptions = {}) {
       return request<RequestRecord[]>(`/api/requests?${p}`);
     },
     requestDetail: (id: string) => request<RequestRecord>(`/api/requests/${enc(id)}`),
+
+    usage: (q: UsageQuery, signal?: AbortSignal) => {
+      const p = new URLSearchParams({ window: q.window, source: q.source });
+      if (q.connection_id) p.set('connection_id', q.connection_id);
+      if (q.provider) p.set('provider', q.provider);
+      if (q.model) p.set('model', q.model);
+      if (q.client_key_id) p.set('client_key_id', q.client_key_id);
+      return request<UsageReport>(`/api/usage?${p}`, { signal });
+    },
+    pricing: () => request<PricingTable>('/api/usage/pricing'),
+    savePriceOverrides: (overrides: PriceOverride[]) => request<PricingTable>('/api/usage/pricing/overrides', { method: 'PUT', body: { overrides } }),
+    usageSources: () => request<UsageSources>('/api/usage/sources'),
+    refreshUsage: (id?: string) => request<{ accepted: boolean; message?: string }>('/api/usage/refresh', { method: 'POST', body: id ? { id } : {} }),
+    monitors: () => request<UsageMonitor[]>('/api/usage/monitors'),
+    createMonitor: (body: MonitorInput) => request<UsageMonitor>('/api/usage/monitors', { method: 'POST', body }),
+    updateMonitor: (id: string, body: MonitorInput) => request<UsageMonitor>(`/api/usage/monitors/${enc(id)}`, { method: 'PUT', body }),
+    deleteMonitor: (id: string) => request<void>(`/api/usage/monitors/${enc(id)}`, { method: 'DELETE' }),
+    importUsage: (provider: UsageImportProvider, path?: string) =>
+      request<UsageImportResult>('/api/usage/import', { method: 'POST', body: path ? { provider, path } : { provider } }),
+
+    nativeHistory: () => request<unknown>('/api/usage/native').then(normalizeNative),
+    importNativeHistory: (source: string) => request<{ accepted: boolean; message?: string }>('/api/usage/native/import', { method: 'POST', body: { source } }),
+    clearNativeHistory: (source: string) => request<void>(`/api/usage/native/${enc(source)}`, { method: 'DELETE' }),
 
     keys: () => request<ApiKey[]>('/api/keys'),
     createKey: (name: string) => request<CreatedApiKey>('/api/keys', { method: 'POST', body: { name } }),

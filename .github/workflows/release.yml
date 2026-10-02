@@ -77,7 +77,8 @@ jobs:
           name="switchyard-v${VERSION}-${PLATFORM}"
           exe=switchyard; [ "$RUNNER_OS" = Windows ] && exe=switchyard.exe
           mkdir -p "dist/$name"
-          cp "target/release/$exe" LICENSE README.md CHANGELOG.md "dist/$name/"
+          cp "target/release/$exe" LICENSE THIRD_PARTY_NOTICES.md README.md CHANGELOG.md "dist/$name/"
+          cp -R docs "dist/$name/docs"
           cd dist
           if [ "$RUNNER_OS" = Windows ]; then
             7z a -tzip -bso0 "$name.zip" "$name"
@@ -97,7 +98,7 @@ jobs:
             *) tar -xzf "$ARCHIVE" -C "$check" ;;
           esac
           dir="$check/switchyard-v${VERSION}-${PLATFORM}"
-          for f in LICENSE README.md CHANGELOG.md; do test -f "$dir/$f"; done
+          for f in LICENSE THIRD_PARTY_NOTICES.md README.md CHANGELOG.md docs/clients.md docs/providers.md docs/usage.md docs/usage-sources.md; do test -f "$dir/$f"; done
           exe="$dir/switchyard"; [ "$RUNNER_OS" = Windows ] && exe="$dir/switchyard.exe"
           if [ "$RUNNER_OS" != Windows ]; then
             test -x "$exe"

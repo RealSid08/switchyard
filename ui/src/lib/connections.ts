@@ -63,6 +63,8 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 
 export const COMPATIBLE_ENDPOINTS: { label: string; baseUrl: string; local?: boolean }[] = [
   { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
+  { label: 'OpenCode Zen', baseUrl: 'https://opencode.ai/zen/v1' },
+  { label: 'OpenCode Go', baseUrl: 'https://opencode.ai/zen/go/v1' },
   { label: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' },
   { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1' },
   { label: 'Ollama', baseUrl: 'http://127.0.0.1:11434/v1', local: true },
@@ -156,7 +158,7 @@ export function strandedRoutes(routes: Route[] | undefined, connections: Connect
 }
 
 /** Disambiguate accounts that share a display name (common with several Codex logins). */
-export function displayNames(connections: Connection[]): Map<string, string> {
+export function displayNames(connections: Pick<Connection, 'id' | 'name'>[]): Map<string, string> {
   const counts = new Map<string, number>();
   for (const c of connections) counts.set(c.name, (counts.get(c.name) ?? 0) + 1);
   const out = new Map<string, string>();

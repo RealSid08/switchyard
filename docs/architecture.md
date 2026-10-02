@@ -61,6 +61,16 @@ All `/api` routes except `/api/hello`, `/api/session` and `/healthz` need the ad
   - A 401 gets one token renewal or source adoption and one retry. Discovery never changes the connection's configured models; the caller saves a selection with `PUT /api/connections/{id}`.
 - **`GET /api/requests/{id}`** returns one retained history record, or 404 once it has been pruned from the newest 1,000.
 
+## Usage sources and accounting
+
+`src/usage.rs` meters HTTP/SSE requests and individual WebSocket turns. `src/pricing.rs` freezes estimates using the price card at event time. SQLite holds a raw usage ledger, hourly/daily aggregates and permanent compact deduplication keys. Unknown token dimensions, billing and outcomes remain unknown; estimates and provider-reported charges are separate.
+
+`src/usage_sources.rs` polls provider quotas and supported cost reports with cached reads, bounded deadlines, coalescing and backoff. Account identity checks prevent a rotated credential from attaching another account's data. Connected Go protocol entries share one quota read.
+
+`src/native_usage.rs` imports local history through opt-in read-only jobs. Work is bounded and checkpointed; generations reject stale completion after removal or restart. Gateway and native totals are combined only when non-overlap is proven. See [usage](usage.md) and [usage sources](usage-sources.md).
+
+`src/antigravity.rs` and its translation modules handle Google account project discovery, catalogs and quota, and translate supported inference protocols. Unsupported Responses and WebSocket contracts are rejected.
+
 ## Persistence and concurrency
 
 SQLite calls take a short synchronous lock and never hold it across network waits. Each account has an async lock used by token renewal, reimport and connection edits, so concurrent requests renew a token once and edits are never overwritten by a refresh. Request history keeps the newest 1,000 records, pruned in the same transaction as each insert; lifetime counters (total, success, failure, per transport) are stored separately and survive restarts and pruning. The overview's median latency and per-minute series describe the retained history.

@@ -2,7 +2,7 @@
 
 **One local gateway. Your models. A control room you actually want to use.**
 
-Switchyard is an open-source Rust gateway for coding agents and AI clients. Connect Codex and Claude subscription accounts or API providers, give every client one endpoint, and see what happens without recording prompts.
+Switchyard is an open-source Rust gateway for coding agents and AI clients. Connect Codex, Claude, OpenCode Go and Antigravity accounts or API providers, give every client one endpoint, and see what happens without recording prompts.
 
 Inspired by [Maria's request](https://x.com/maria_rcks/status/2105868321853984972) for CLIProxyAPI in Rust, with a nice UI and WebSockets. Maria works on T3 Code; the design targets developers who move between coding agents and want their provider connections to keep up.
 
@@ -19,6 +19,8 @@ Inspired by [Maria's request](https://x.com/maria_rcks/status/210586832185398497
 - **Streaming that tells the truth.** SSE is forwarded incrementally with backpressure and cancellation. A stream that ends without its protocol's completion marker gets a structured `upstream_interrupted` error event and is logged as a failure, not a success.
 - **Multi-account reliability.** Round-robin and failover routes, account cooldowns that follow `Retry-After` and provider reset hints, and response affinity that keeps a conversation on the account that owns it, even across restarts.
 - **Account visibility.** Each connection shows whether it is ready, rate limited per model, cooling down or disabled, with its last result and credential expiry. The provider's own model catalog can be listed to choose identifiers, and any request still in the history can be looked up by id.
+- **Usage across your tools.** Durable request and WebSocket-turn accounting, token dimensions, API estimates, subscription equivalents, and live plan limits. Read-only Codex, Claude Code and OpenCode history imports and Cursor account monitoring include activity outside the gateway. Sources with unproven overlap remain separate. See [usage](docs/usage.md) and [source capabilities](docs/usage-sources.md).
+- **More coding clients and providers.** OpenCode Zen and Go imports, Antigravity translation, and setup guides for OpenCode and Cursor BYOK. See [providers](docs/providers.md) for exact support and limitations.
 - **Private by default.** Loopback bind, separate admin and client credentials, hashed client keys, per-browser admin sessions with logout, metadata-only request history.
 
 Switchyard is an independent implementation, not a full port of every CLIProxyAPI provider. See the [compatibility guide](docs/compatibility.md) for exact protocol behavior and limits.
@@ -60,6 +62,9 @@ Imports are also available from the command line. They read files on the **machi
 switchyard import codex                 # $CODEX_HOME/auth.json or ~/.codex/auth.json
 switchyard import claude                # $CLAUDE_CONFIG_DIR or ~/.claude, then the macOS Keychain
 switchyard import cliproxy --path /path/to/cliproxy/auths
+switchyard import opencode              # native Zen and Go keys, read-only
+switchyard import opencode_go           # Go only
+switchyard import antigravity           # native Google credentials when available
 switchyard token-path                   # where the admin token lives
 switchyard --help
 ```

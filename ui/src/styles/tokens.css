@@ -79,6 +79,15 @@
   --chart-primary: #7f8b99;
   --chart-error: #f2555a;
   --chart-grid: #1d2229;
+  /* Token mix: validated categorical slots 1-4 (dataviz reference palette), dark steps. */
+  --mix-input: #3987e5;
+  --mix-cache-read: #d95926;
+  --mix-cache-write: #199e70;
+  --mix-output: #c98500;
+  /* Cost by billing: slots 1-2 plus a neutral drawn hatched for "billing unknown" (validated all-pairs). */
+  --bill-api: #3987e5;
+  --bill-sub: #d95926;
+  --bill-unknown: #6b737d;
 
   --focus: #ffbb55;
   --shadow-sm: 0 1px 0 rgb(0 0 0 / 0.4);
@@ -135,6 +144,13 @@
   --chart-primary: #8a929c;
   --chart-error: #d13438;
   --chart-grid: #ecece6;
+  --mix-input: #2a78d6;
+  --mix-cache-read: #eb6834;
+  --mix-cache-write: #1baf7a;
+  --mix-output: #eda100;
+  --bill-api: #2a78d6;
+  --bill-sub: #eb6834;
+  --bill-unknown: #8a929c;
 
   --focus: #c77a0a;
   --shadow-sm: 0 1px 0 rgb(20 20 10 / 0.04);
