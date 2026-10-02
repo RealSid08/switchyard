@@ -693,6 +693,9 @@ pub fn cursor_event(e: &Value, account: &str, label: &str) -> Option<ExternalUsa
     // Events billed to the user's own API key may have gone through a custom base URL.
     let byok = kind.to_ascii_lowercase().contains("api key")
         || kind.to_ascii_lowercase().contains("api_key");
+    let kind = kind.to_ascii_lowercase();
+    let invoice_charge = !byok && matches!(kind.as_str(), "usage_based" | "on_demand");
+    let plan_usage = matches!(kind.as_str(), "included_in_pro" | "included");
     Some(ExternalUsage {
         collector: "cursor_events".into(),
         client_id: Some("external:cursor".into()),
@@ -702,10 +705,21 @@ pub fn cursor_event(e: &Value, account: &str, label: &str) -> Option<ExternalUsa
         provider: "cursor".into(),
         model: model.chars().take(120).collect(),
         account_label: Some(label.chars().take(120).collect()),
-        billing: if byok { "api_key" } else { "subscription" }.into(),
+        billing: if byok {
+            "api_key"
+        } else if invoice_charge || plan_usage {
+            "subscription"
+        } else {
+            "unknown"
+        }
+        .into(),
         tokens,
-        estimated_cost_micros: None,
-        reported_cost_micros: charged,
+        estimated_cost_micros: if !byok && !invoice_charge {
+            charged
+        } else {
+            None
+        },
+        reported_cost_micros: if invoice_charge { charged } else { None },
         disjoint: !byok
             && matches!(
                 kind.to_ascii_lowercase().as_str(),
@@ -734,7 +748,7 @@ async fn scan_cursor(
         _ => {}
     }
     let account = &identity[..16];
-    let label = format!("Cursor: {}", m.name);
+    let label = format!("Cursor: {} (account {})", m.name, &identity[..8]);
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut w = cp.cursor.clone().unwrap_or_else(|| CursorWindow {
         start_ms: cp
@@ -761,9 +775,24 @@ async fn scan_cursor(
             .header("origin", "https://cursor.com")
             .header("accept", "application/json")
             .json(&json!({"page": w.page, "pageSize": CURSOR_PAGE_SIZE, "startDate": w.start_ms.to_string(), "endDate": w.end_ms.to_string()}));
-        let v = tokio::time::timeout(Duration::from_secs(20), send_json(rb))
-            .await
-            .unwrap_or(Err(FetchError::Timeout))?;
+        if !app
+            .store
+            .get::<Checkpoint>(CHECKPOINT_KIND, &cp.source)
+            .is_some_and(|current| current.enabled && current.generation == cp.generation)
+        {
+            return Ok((Vec::new(), false));
+        }
+        let remaining = CHUNK_DEADLINE
+            .min(app.timeout)
+            .saturating_sub(started.elapsed());
+        let v = match tokio::time::timeout(remaining, send_json(rb)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                // Retain completed pages, but retry the unfinished page next chunk.
+                cp.cursor = Some(w);
+                return Ok((out, true));
+            }
+        };
         if !v.is_object() {
             return Err(FetchError::Parse);
         }
@@ -812,12 +841,20 @@ fn label_for(source: &str) -> &'static str {
         _ => "Cursor account usage events",
     }
 }
+/// Called under the collector write lock so in-flight jobs cannot resurrect this source.
+pub(crate) fn forget_monitor(app: &App, monitor_id: &str) -> rusqlite::Result<()> {
+    app.store
+        .delete(CHECKPOINT_KIND, &format!("cursor:{monitor_id}"))
+}
+
 fn valid_source(app: &App, source: &str) -> bool {
     match source.strip_prefix("cursor:") {
         Some(mid) => app
             .store
             .get::<Monitor>(usage_sources::MONITOR_KIND, mid)
-            .is_some_and(|m| m.provider == "cursor" && m.credential_source != "api_key"),
+            .is_some_and(|m| {
+                m.enabled && m.provider == "cursor" && m.credential_source != "api_key"
+            }),
         None => matches!(source, "opencode" | "codex" | "claude"),
     }
 }
@@ -1115,6 +1152,15 @@ async fn import(
     Json(body): Json<ImportBody>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let source = body.source.trim().to_string();
+    if source
+        .strip_prefix("cursor:")
+        .and_then(|id| app.store.get::<Monitor>(usage_sources::MONITOR_KIND, id))
+        .is_some_and(|m| !m.enabled)
+    {
+        return Err(ApiError::bad(
+            "Enable the Cursor watcher before importing its history.",
+        ));
+    }
     if !valid_source(&app, &source) {
         return Err(ApiError::bad(
             "source must be opencode, codex, claude or cursor:<monitor id>",

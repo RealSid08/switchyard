@@ -96,6 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {}
     }
+    // Install signal handlers before exposing a ready listener.
+    let shutdown = shutdown_signal()?;
     let listener = tokio::net::TcpListener::bind((cli.host.as_str(), cli.port)).await?;
     let address = listener.local_addr()?;
     let endpoint = serde_json::json!({"pid":std::process::id(),"port":address.port(),"host":address.ip().to_string()});
@@ -142,24 +144,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::pin!(server);
     tokio::select! {
         result=&mut server=>{result?;},
-        _=shutdown_signal()=>{let _=stop_tx.send(());if tokio::time::timeout(std::time::Duration::from_secs(10),&mut server).await.is_err(){tracing::info!("Shutdown drain deadline reached");}}
+        _=shutdown=>{let _=stop_tx.send(());if tokio::time::timeout(std::time::Duration::from_secs(10),&mut server).await.is_err(){tracing::info!("Shutdown drain deadline reached");}}
     }
     Ok(())
 }
-async fn shutdown_signal() {
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     {
-        if let Ok(mut term) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-        } else {
-            let _ = tokio::signal::ctrl_c().await;
-        }
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! { _=term.recv()=>{}, _=interrupt.recv()=>{} }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
     }
 }
 

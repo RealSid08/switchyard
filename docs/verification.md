@@ -1,8 +1,8 @@
-# v0.2 verification
+# v0.2.1 verification
 
 Verified on 2026-10-03 on Apple Silicon macOS:
 
-- Rust formatting, Clippy with warnings denied, and 250 Rust tests.
+- Rust formatting, Clippy with warnings denied, and 253 Rust tests.
 - UI typecheck, lint, 150 unit tests and 38 browser tests against the production bundle.
 - OpenAI Python SDK native Codex stream and two Responses WebSocket turns with continuation.
 - OpenCode 2.0.21 in an isolated home and standalone server, through Switchyard to Go, including a read tool and the correct final file contents.

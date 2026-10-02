@@ -2604,6 +2604,9 @@ async fn update_monitor(
                 "This monitor changed while saving. Reload and try again.",
             ));
         }
+        if !m.enabled || changed_credential {
+            crate::native_usage::forget_monitor(&app, &mid).map_err(ApiError::db)?;
+        }
         m.version = stored.version + 1;
         m.updated_at = now();
         app.store
@@ -2628,6 +2631,7 @@ async fn delete_monitor(
     if app.store.get::<Monitor>(MONITOR_KIND, &mid).is_none() {
         return Err(ApiError::new(404, "Monitor not found"));
     }
+    crate::native_usage::forget_monitor(&app, &mid).map_err(ApiError::db)?;
     app.store.delete(MONITOR_KIND, &mid).map_err(ApiError::db)?;
     app.store
         .delete(SNAPSHOT_KIND, &format!("monitor:{mid}"))

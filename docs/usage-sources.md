@@ -48,7 +48,7 @@ Historical ownership is taken from records when available, otherwise labelled by
 
 A provider named Switchyard is excluded from identifiable native records. Claude response IDs already observed by the gateway are excluded too. Other history may overlap gateway traffic and stays separate. Stable event identifiers survive raw-event retention, so repeated imports do not change totals.
 
-OpenCode's SDK cost is an estimate, not a charge. Unknown historical billing has its own subtotal. Cursor provider-reported billed amounts and organization reports retain their source and period; they are never added to gateway estimates.
+OpenCode's SDK cost is an estimate, not a charge. Unknown historical billing has its own subtotal. Cursor included-plan deductions are usage value, while explicit on-demand events report charges. Unknown event kinds retain unknown billing. Organization reports retain their source and period; they are never added to gateway estimates.
 
 Prompts, generated text and tool arguments are never stored in the usage ledger. JSONL files must be scanned to find metadata records; their contents are not retained. OpenCode uses SQL JSON extraction. Chosen import paths and credential source locations remain private checkpoint/configuration state. Public APIs never return credential values. The data directory and backups must remain private.
 
