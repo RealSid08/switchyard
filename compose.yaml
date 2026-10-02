@@ -1,0 +1,19 @@
+services:
+  switchyard:
+    build: .
+    image: switchyard:local
+    ports:
+      # Host loopback only. Keep both sides 7410: admin cookies are bound to the configured port.
+      - '127.0.0.1:7410:7410'
+    volumes:
+      - switchyard-data:/home/switchyard/.local/share/switchyard
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    restart: unless-stopped
+volumes:
+  switchyard-data:

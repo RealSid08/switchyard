@@ -1,0 +1,16 @@
+name: Bug report
+description: Report a reproducible problem
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include expected behavior and reproducible steps. Never paste credentials or prompts containing private data.
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes: { label: Switchyard version and operating system }
+    validations: { required: true }
+  - type: textarea
+    id: protocol
+    attributes: { label: Provider and protocol, redacted logs }

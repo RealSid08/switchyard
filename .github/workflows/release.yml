@@ -1,0 +1,150 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  version:
+    name: Tag matches Cargo version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::Tag $TAG is not vMAJOR.MINOR.PATCH"; exit 1; }
+          [ "$TAG" = "v$version" ] || { echo "::error::Tag $TAG does not match Cargo.toml version $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # Every CI gate (format, Clippy, UI typecheck/lint/unit/e2e, Rust tests on three OSes,
+  # container smoke test) must pass before anything is built for release.
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read # checks only; nothing is published by CI
+
+  build:
+    name: Package ${{ matrix.platform }}
+    needs: [version, ci]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux builds on the oldest supported image so the binary runs on older glibc
+          # (Ubuntu 22.04, Debian 12 and newer).
+          - { os: ubuntu-22.04, platform: linux-x86_64, triple: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, platform: linux-aarch64, triple: aarch64-unknown-linux-gnu }
+          - { os: macos-15, platform: macos-aarch64, triple: aarch64-apple-darwin }
+          - { os: windows-2025, platform: windows-x86_64, triple: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+      TRIPLE: ${{ matrix.triple }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The exact UI bundle that passed the e2e gate in this run.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ui-dist
+          path: ui/dist
+      # Installs the toolchain and components pinned in rust-toolchain.toml (preinstalled rustup).
+      - run: rustup toolchain install && rustc --version
+      # No build cache for release artifacts.
+      - name: Check runner architecture
+        shell: bash
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          [ "$host" = "$TRIPLE" ] || { echo "::error::Runner host $host, expected $TRIPLE"; exit 1; }
+      - run: cargo build --release --locked
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name="switchyard-v${VERSION}-${PLATFORM}"
+          exe=switchyard; [ "$RUNNER_OS" = Windows ] && exe=switchyard.exe
+          mkdir -p "dist/$name"
+          cp "target/release/$exe" LICENSE README.md CHANGELOG.md "dist/$name/"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip -bso0 "$name.zip" "$name"
+            echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Smoke test the packaged binary
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          check=$(mktemp -d)
+          case "$ARCHIVE" in
+            *.zip) 7z x -bso0 -o"$(cygpath -w "$check")" "$ARCHIVE" ;;
+            *) tar -xzf "$ARCHIVE" -C "$check" ;;
+          esac
+          dir="$check/switchyard-v${VERSION}-${PLATFORM}"
+          for f in LICENSE README.md CHANGELOG.md; do test -f "$dir/$f"; done
+          exe="$dir/switchyard"; [ "$RUNNER_OS" = Windows ] && exe="$dir/switchyard.exe"
+          if [ "$RUNNER_OS" != Windows ]; then
+            test -x "$exe"
+            file "$exe"
+          fi
+          bash .github/scripts/smoke-binary.sh "$exe" "$VERSION"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.platform }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # sign build provenance
+      attestations: write # store build provenance
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: artifacts
+      - name: Check every platform is present
+        working-directory: artifacts
+        run: |
+          ls -l
+          test "$(find . -maxdepth 1 -name 'switchyard-v*' \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 4
+          sha256sum switchyard-v* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/switchyard-v*.tar.gz
+            artifacts/switchyard-v*.zip
+      - name: Create release
+        working-directory: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          [[ "$TAG" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$TAG" switchyard-v* SHA256SUMS --verify-tag --generate-notes --title "Switchyard $TAG" "${prerelease[@]}"

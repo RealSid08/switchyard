@@ -1,0 +1,31 @@
+.mock-panel {
+  position: fixed;
+  left: calc(var(--sidebar-w) + 12px);
+  bottom: 12px;
+  z-index: 70;
+}
+@media (max-width: 900px) {
+  .mock-panel {
+    left: 12px;
+  }
+}
+.mock-toggle {
+  border-style: dashed;
+  opacity: 0.75;
+}
+.mock-toggle:hover {
+  opacity: 1;
+}
+.mock-panel-body {
+  display: grid;
+  gap: 6px;
+  width: 210px;
+  padding: 10px;
+  border: 1px dashed var(--brand-line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+.mock-panel-body .btn {
+  justify-content: flex-start;
+}

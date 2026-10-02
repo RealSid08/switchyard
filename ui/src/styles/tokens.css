@@ -1,0 +1,153 @@
+/*
+ * Switchyard design tokens.
+ * Direction: a calm signal box. Graphite surfaces, hairline rules, one warm
+ * "signal lamp" amber for the brand, and status colours reserved for state.
+ */
+
+:root {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'Inter', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+
+  --text-xs: 11.5px;
+  --text-sm: 12.5px;
+  --text-md: 13.5px;
+  --text-lg: 15px;
+  --text-xl: 19px;
+  --text-2xl: 24px;
+  --text-hero: 30px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+
+  --sidebar-w: 236px;
+  --content-max: 1240px;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-slow: 280ms;
+}
+
+:root,
+[data-theme='dark'] {
+  --bg: #0b0d10;
+  --bg-sunken: #08090b;
+  --surface: #111418;
+  --surface-2: #161a1f;
+  --surface-3: #1c2127;
+  --surface-hover: #1a1f25;
+  --border: #232931;
+  --border-strong: #303741;
+  --rule: #1b2026;
+
+  --text: #e7eaee;
+  --text-2: #a9b1bc;
+  --text-muted: #808a97;
+  --text-faint: #5d6672;
+
+  --brand: #f2a93b;
+  --brand-strong: #ffbb55;
+  --brand-ink: #1b1204;
+  --brand-text: #f6b75a;
+  --brand-soft: rgb(242 169 59 / 0.12);
+  --brand-line: rgb(242 169 59 / 0.35);
+
+  --ok: #3fcf8e;
+  --ok-text: #5ad9a0;
+  --ok-soft: rgb(63 207 142 / 0.12);
+  --err: #f2555a;
+  --err-text: #ff7b7f;
+  --err-soft: rgb(242 85 90 / 0.12);
+  --warn: #f2a93b;
+  --warn-text: #f6b75a;
+  --warn-soft: rgb(242 169 59 / 0.12);
+  --info: #5aa9ff;
+  --info-text: #7dbbff;
+  --info-soft: rgb(90 169 255 / 0.12);
+
+  --chart-primary: #7f8b99;
+  --chart-error: #f2555a;
+  --chart-grid: #1d2229;
+
+  --focus: #ffbb55;
+  --shadow-sm: 0 1px 0 rgb(0 0 0 / 0.4);
+  --shadow: 0 8px 24px -8px rgb(0 0 0 / 0.6), 0 0 0 1px rgb(255 255 255 / 0.03);
+  --shadow-lg: 0 24px 60px -12px rgb(0 0 0 / 0.7), 0 0 0 1px rgb(255 255 255 / 0.04);
+  --backdrop: rgb(4 5 7 / 0.66);
+
+  --code-bg: #0d1013;
+  --code-key: #9ecbff;
+  --code-str: #b6e3a1;
+  --code-num: #f8c37a;
+  --code-com: #7f8895;
+  --code-kw: #e7a0ff;
+
+  color-scheme: dark;
+}
+
+[data-theme='light'] {
+  --bg: #f6f6f3;
+  --bg-sunken: #efefeb;
+  --surface: #ffffff;
+  --surface-2: #f9f9f7;
+  --surface-3: #f1f1ed;
+  --surface-hover: #f4f4f0;
+  --border: #e3e3dd;
+  --border-strong: #cfcfc7;
+  --rule: #ecece6;
+
+  --text: #15181d;
+  --text-2: #464d57;
+  --text-muted: #636b76;
+  --text-faint: #8a919b;
+
+  --brand: #f2a93b;
+  --brand-strong: #e59a26;
+  --brand-ink: #1b1204;
+  --brand-text: #9a5800;
+  --brand-soft: rgb(242 169 59 / 0.16);
+  --brand-line: rgb(196 120 10 / 0.4);
+
+  --ok: #14945f;
+  --ok-text: #0e7a4e;
+  --ok-soft: rgb(20 148 95 / 0.1);
+  --err: #d13438;
+  --err-text: #b4262a;
+  --err-soft: rgb(209 52 56 / 0.08);
+  --warn: #c77a0a;
+  --warn-text: #94570a;
+  --warn-soft: rgb(242 169 59 / 0.16);
+  --info: #2a6fd6;
+  --info-text: #1f5bb5;
+  --info-soft: rgb(42 111 214 / 0.09);
+
+  --chart-primary: #8a929c;
+  --chart-error: #d13438;
+  --chart-grid: #ecece6;
+
+  --focus: #c77a0a;
+  --shadow-sm: 0 1px 0 rgb(20 20 10 / 0.04);
+  --shadow: 0 8px 24px -10px rgb(30 30 20 / 0.18), 0 0 0 1px rgb(20 20 10 / 0.04);
+  --shadow-lg: 0 24px 60px -16px rgb(30 30 20 / 0.28), 0 0 0 1px rgb(20 20 10 / 0.05);
+  --backdrop: rgb(30 30 25 / 0.32);
+
+  --code-bg: #fbfbf9;
+  --code-key: #1f5bb5;
+  --code-str: #2c7a2c;
+  --code-num: #a35a00;
+  --code-com: #69707a;
+  --code-kw: #8a3fb5;
+
+  color-scheme: light;
+}
