@@ -651,9 +651,11 @@ pub fn price(model: &str, day: &str, tokens: &Tokens, overrides: &[Override]) ->
     if card.audio_distinct && tokens.audio_input.unwrap_or(0) > 0 {
         return Priced::unpriced("audio_rate_not_modelled", version);
     }
-    let total_input = tokens.input.unwrap_or(0)
-        + tokens.cache_read.unwrap_or(0)
-        + tokens.cache_write.unwrap_or(0);
+    let total_input = tokens
+        .input
+        .unwrap_or(0)
+        .saturating_add(tokens.cache_read.unwrap_or(0))
+        .saturating_add(tokens.cache_write.unwrap_or(0));
     let rate = match card.long {
         Some((threshold, long)) if total_input > threshold => long,
         _ => card.base,
@@ -724,7 +726,7 @@ fn cost(rate: &Rate, t: &Tokens) -> Result<u64, &'static str> {
     add(t.output, rate.output)?;
     add(t.cache_read, rate.cache_read)?;
     match (t.cache_write_5m, t.cache_write_1h) {
-        (Some(w5), Some(w1)) if w5 + w1 == t.cache_write.unwrap_or(0) => {
+        (Some(w5), Some(w1)) if w5.checked_add(w1) == t.cache_write => {
             add(Some(w5), rate.cache_write_5m.or(rate.cache_write))?;
             add(Some(w1), rate.cache_write_1h)?;
         }

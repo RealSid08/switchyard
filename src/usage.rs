@@ -68,7 +68,7 @@ impl Tokens {
         [self.input, self.cache_read, self.cache_write, self.output]
             .iter()
             .flatten()
-            .sum()
+            .fold(0u64, |sum, value| sum.saturating_add(*value))
     }
 }
 
@@ -219,8 +219,8 @@ fn anthropic(u: &Value) -> Option<Tokens> {
 fn gemini(m: &Value) -> Option<Tokens> {
     // The Gemini API omits zero-valued counters, so an absent counter next to a present
     // promptTokenCount is 0, not unknown.
-    let prompt =
-        n(&m["promptTokenCount"]).map(|p| p + n(&m["toolUsePromptTokenCount"]).unwrap_or(0));
+    let prompt = n(&m["promptTokenCount"])
+        .map(|p| p.saturating_add(n(&m["toolUsePromptTokenCount"]).unwrap_or(0)));
     let candidates = n(&m["candidatesTokenCount"]);
     let thoughts = n(&m["thoughtsTokenCount"]);
     if prompt.is_none() && candidates.is_none() && thoughts.is_none() {
@@ -242,12 +242,20 @@ fn gemini(m: &Value) -> Option<Tokens> {
             .flat_map(|k| m[*k].as_array().into_iter().flatten())
             .filter(|d| d["modality"] == "AUDIO")
             .filter_map(|d| n(&d["tokenCount"]))
-            .sum();
+            .fold(0u64, u64::saturating_add);
         t.audio_input = Some(audio);
-        t.output = Some(candidates.unwrap_or(0) + thoughts.unwrap_or(0));
+        t.output = Some(
+            candidates
+                .unwrap_or(0)
+                .saturating_add(thoughts.unwrap_or(0)),
+        );
         t.reasoning = Some(thoughts.unwrap_or(0));
     } else {
-        t.output = Some(candidates.unwrap_or(0) + thoughts.unwrap_or(0));
+        t.output = Some(
+            candidates
+                .unwrap_or(0)
+                .saturating_add(thoughts.unwrap_or(0)),
+        );
         t.reasoning = Some(thoughts.unwrap_or(0));
     }
     Some(t)
@@ -425,6 +433,23 @@ fn overrides(store: &Store) -> Vec<Override> {
 
 /// Prices `e` in place with the card in force on its day (frozen into the event).
 pub fn apply_price(e: &mut UsageEvent, overrides: &[Override]) {
+    // Impossible per-request counters must not poison the integer ledger. Preserve the unit
+    // and its outcome, but treat out-of-range dimensions as unreported rather than clamp them.
+    for dimension in [
+        &mut e.tokens.input,
+        &mut e.tokens.cache_read,
+        &mut e.tokens.cache_write,
+        &mut e.tokens.cache_write_5m,
+        &mut e.tokens.cache_write_1h,
+        &mut e.tokens.output,
+        &mut e.tokens.reasoning,
+        &mut e.tokens.audio_input,
+    ] {
+        if dimension.is_some_and(|n| n > 1_000_000_000_000) {
+            *dimension = None;
+        }
+    }
+
     let p = pricing::price_provider(
         e.provider.as_deref().unwrap_or(""),
         &e.model,
@@ -979,7 +1004,7 @@ pub(crate) fn metric_values(e: &UsageEvent) -> Vec<i64> {
     }
     if let (Some(a), Some(b), Some(c)) = (t.input, t.cache_read, t.cache_write) {
         set("ce_n", 1);
-        set("ce_total", i(a + b + c));
+        set("ce_total", i(a.saturating_add(b).saturating_add(c)));
         set("ce_read", i(b));
     }
     match e.cost_micros {
@@ -1288,7 +1313,10 @@ fn money(micros: i64, known: bool) -> (Value, Value) {
 pub(crate) fn metrics_json(a: &Agg) -> Value {
     let g = |m| a.get(m);
     let units = g("units");
-    let tokens_total = g("in_sum") + g("cr_sum") + g("cw_sum") + g("out_sum");
+    let tokens_total = g("in_sum")
+        .saturating_add(g("cr_sum"))
+        .saturating_add(g("cw_sum"))
+        .saturating_add(g("out_sum"));
     let (est, est_usd) = money(g("cost_sum"), g("priced") > 0);
     let (rep, rep_usd) = money(g("rep_sum"), g("rep_n") > 0);
     let mut unit_counts = json!({"total": units, "succeeded": g("succeeded"), "failed": g("failed"), "cancelled": g("cancelled")});

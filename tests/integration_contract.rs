@@ -171,3 +171,41 @@ async fn native_unknown_billing_and_outcome_are_not_guessed() {
     assert!(totals["success_rate"].is_null());
     assert!(totals["cost"]["reported_micros"].is_null());
 }
+
+#[tokio::test]
+async fn impossible_provider_counters_remain_unknown_without_poisoning_totals() {
+    use switchyard::usage::{ExternalUsage, Tokens, record_external};
+    let dir = tempfile::tempdir().unwrap();
+    let gw = Gateway::start(dir.path()).await;
+    for id in ["a", "b"] {
+        record_external(
+            &gw.app.store,
+            &[ExternalUsage {
+                collector: "corrupt-history".into(),
+                native_id: id.into(),
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                provider: "openai".into(),
+                model: "gpt-6.1-sol".into(),
+                account_label: None,
+                client_id: None,
+                client_name: None,
+                billing: "unknown".into(),
+                tokens: Tokens {
+                    input: Some(u64::MAX),
+                    output: Some(u64::MAX),
+                    cache_read: Some(u64::MAX),
+                    cache_write: Some(u64::MAX),
+                    ..Default::default()
+                },
+                estimated_cost_micros: None,
+                reported_cost_micros: None,
+                disjoint: false,
+            }],
+        )
+        .unwrap();
+    }
+    let s = gw.admin_json("/api/usage?window=24h&source=external").await;
+    assert_eq!(s["totals"]["units"]["total"], 2);
+    assert_eq!(s["totals"]["tokens"]["usage_missing_units"], 2);
+    assert!(s["totals"]["cost"]["estimated_micros"].is_null());
+}

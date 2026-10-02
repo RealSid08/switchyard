@@ -282,7 +282,7 @@ pub fn codex_tokens(u: &Value) -> Option<Tokens> {
     let cached = u["cached_input_tokens"].as_u64();
     let write = u["cache_write_input_tokens"].as_u64();
     Some(Tokens {
-        input: Some(input.saturating_sub(cached.unwrap_or(0) + write.unwrap_or(0))),
+        input: Some(input.saturating_sub(cached.unwrap_or(0).saturating_add(write.unwrap_or(0)))),
         cache_read: cached,
         cache_write: write,
         output: u["output_tokens"].as_u64(),
@@ -517,7 +517,7 @@ pub fn opencode_tokens(
         cache_read: u(read),
         cache_write: u(write),
         output: match (output, reasoning) {
-            (Some(o), Some(r)) => Some(o + r),
+            (Some(o), Some(r)) => Some(o.saturating_add(r)),
             (o, _) => o,
         },
         reasoning,

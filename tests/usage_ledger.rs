@@ -1048,3 +1048,15 @@ fn a_repeated_terminal_never_closes_a_later_turn() {
     );
     assert!(!t.has_open());
 }
+
+#[test]
+fn extreme_provider_counters_do_not_panic_accounting() {
+    let maximum = u64::MAX;
+    let (tokens, _) = switchyard::usage::tokens_from_usage(&json!({"usageMetadata":{"promptTokenCount":maximum,"toolUsePromptTokenCount":1,"candidatesTokenCount":maximum,"thoughtsTokenCount":maximum}}), "gemini").unwrap();
+    assert_eq!(tokens.total(), maximum);
+    let priced = switchyard::pricing::price("gemini-3-pro", "2026-10-03", &tokens, &[]);
+    assert!(priced.cost_micros.is_none());
+    let native = switchyard::native_usage::codex_tokens(&json!({"input_tokens":maximum,"cached_input_tokens":maximum,"cache_write_input_tokens":maximum,"output_tokens":1})).unwrap();
+    assert_eq!(native.input, Some(0));
+    assert_eq!(native.total(), maximum);
+}
