@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Base images are pinned by digest; Dependabot proposes updates.
 
-FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS ui
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS ui
 WORKDIR /app/ui
 RUN npm install --global --no-fund --no-audit pnpm@12.6.0
 COPY ui/package.json ui/pnpm-lock.yaml ./
