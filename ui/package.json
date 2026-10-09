@@ -30,8 +30,8 @@
     "screenshots": "pnpm build && node scripts/e2e.ts --project=screenshots"
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.104.0",
-    "lucide-react": "^1.49.0",
+    "@tanstack/react-query": "^5.104.1",
+    "lucide-react": "^1.52.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },
@@ -40,18 +40,18 @@
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.63.0",
     "@testing-library/react": "^16.3.3",
-    "@types/node": "^24.19.0",
+    "@types/node": "^26.6.4",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/ws": "^8.18.2",
-    "@vitejs/plugin-react": "^6.1.1",
-    "eslint": "^10.11.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.12.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.13.0",
     "happy-dom": "^20.14.5",
-    "typescript": "~6.0.3",
-    "typescript-eslint": "^8.71.0",
-    "vite": "~8.3.1",
+    "typescript": "~7.0.2",
+    "typescript-eslint": "^8.71.1",
+    "vite": "~8.3.3",
     "vitest": "^5.0.3",
     "ws": "^8.22.0"
   }
