@@ -30,29 +30,29 @@
     "screenshots": "pnpm build && node scripts/e2e.ts --project=screenshots"
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.104.0",
-    "lucide-react": "^1.49.0",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0"
+    "@tanstack/react-query": "^5.104.5",
+    "lucide-react": "^1.60.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.13.0",
+    "@axe-core/playwright": "^4.14.0",
     "@eslint/js": "^10.0.1",
-    "@playwright/test": "^1.63.0",
+    "@playwright/test": "^1.64.1",
     "@testing-library/react": "^16.3.3",
-    "@types/node": "^24.19.0",
+    "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/ws": "^8.18.2",
-    "@vitejs/plugin-react": "^6.1.1",
-    "eslint": "^10.11.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.13.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.13.0",
-    "happy-dom": "^20.14.5",
-    "typescript": "~6.0.3",
-    "typescript-eslint": "^8.71.0",
-    "vite": "~8.3.1",
-    "vitest": "^5.0.3",
+    "happy-dom": "^21.0.3",
+    "typescript": "~7.0.2",
+    "typescript-eslint": "^8.72.0",
+    "vite": "~8.3.4",
+    "vitest": "^5.0.5",
     "ws": "^8.22.0"
   }
 }
